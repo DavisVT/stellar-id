@@ -78,6 +78,27 @@ pub struct CredentialCommitment {
     pub committed_at: u64,
 }
 
+/// A pending M-of-N multi-issuer credential request.
+///
+/// A credential is only issued when `approvals.len() >= threshold`.
+/// The initiating issuer's approval is recorded automatically at creation.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MultiSigCredentialRequest {
+    pub id: u64,
+    pub subject: Address,
+    pub schema_id: u32,
+    /// The complete set of issuers eligible to approve this request.
+    pub required_issuers: Vec<Address>,
+    /// Minimum number of approvals needed to issue the credential.
+    pub threshold: u32,
+    /// Issuers that have already approved.
+    pub approvals: Vec<Address>,
+    pub created_at: u64,
+    /// Expiry timestamp (0 = no expiry).
+    pub expires_at: u64,
+}
+
 /// Storage keys
 #[contracttype]
 pub enum DataKey {
@@ -102,6 +123,10 @@ pub enum DataKey {
     BridgeMetadata(u64),
     // (subject, schema_id) -> CredentialCommitment
     Commitment(Address, u32),
+    // request_id -> MultiSigCredentialRequest
+    MultiSigRequest(u64),
+    // u64 counter for multisig request IDs
+    MultiSigRequestCount,
 }
 
 // ============================================================
@@ -1179,6 +1204,159 @@ impl StellarIdContract {
     }
 
     // --------------------------------------------------------
+    // Multi-issuer (M-of-N) credential requests
+    // --------------------------------------------------------
+
+    /// Creates a new M-of-N multi-issuer credential request.
+    ///
+    /// `initiator_issuer` must be an active registered issuer and must appear in
+    /// `required_issuers`. `threshold` must be at least 1 and at most
+    /// `required_issuers.len()`. The initiator's approval is recorded
+    /// automatically. A `duration_seconds` value of `0` creates a
+    /// non-expiring request.
+    ///
+    /// Returns the newly assigned request identifier.
+    ///
+    /// Panics if any precondition is violated.
+    pub fn create_multisig_request(
+        env: Env,
+        initiator_issuer: Address,
+        subject: Address,
+        schema_id: u32,
+        required_issuers: Vec<Address>,
+        threshold: u32,
+        duration_seconds: u64,
+    ) -> u64 {
+        initiator_issuer.require_auth();
+        Self::require_active_issuer(&env, &initiator_issuer);
+        Self::require_active_schema(&env, schema_id);
+
+        assert!(
+            !required_issuers.is_empty(),
+            "required_issuers cannot be empty"
+        );
+        assert!(threshold >= 1, "threshold must be at least 1");
+        assert!(
+            threshold <= required_issuers.len() as u32,
+            "threshold cannot exceed number of required issuers"
+        );
+
+        // initiator must be in required_issuers
+        let initiator_in_list = required_issuers.iter().any(|a| a == initiator_issuer);
+        assert!(
+            initiator_in_list,
+            "initiator_issuer must be in required_issuers"
+        );
+
+        let now = env.ledger().timestamp();
+        let expires_at = if duration_seconds > 0 {
+            now + duration_seconds
+        } else {
+            0
+        };
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigRequestCount)
+            .unwrap_or(0);
+        let request_id = count + 1;
+
+        // Auto-record initiator's approval
+        let mut approvals: Vec<Address> = Vec::new(&env);
+        approvals.push_back(initiator_issuer.clone());
+
+        let request = MultiSigCredentialRequest {
+            id: request_id,
+            subject: subject.clone(),
+            schema_id,
+            required_issuers: required_issuers.clone(),
+            threshold,
+            approvals,
+            created_at: now,
+            expires_at,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MultiSigRequest(request_id), &request);
+        env.storage()
+            .instance()
+            .set(&DataKey::MultiSigRequestCount, &request_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "multisig_request_created"),),
+            (request_id, subject, schema_id, threshold, required_issuers.len()),
+        );
+
+        // If initiator alone meets threshold (1-of-1 or similar), auto-issue immediately
+        if 1u32 >= threshold {
+            Self::issue_multisig_credential(&env, request_id);
+        }
+
+        request_id
+    }
+
+    /// Records an approval from `issuer` for the given multisig request.
+    ///
+    /// `issuer` must be in `required_issuers`, must not have already approved,
+    /// and the request must not have expired. When the total approval count
+    /// reaches `threshold` the credential is automatically issued.
+    ///
+    /// Panics if any precondition is violated or the request does not exist.
+    pub fn approve_multisig_request(env: Env, issuer: Address, request_id: u64) {
+        issuer.require_auth();
+        Self::require_active_issuer(&env, &issuer);
+
+        let mut request: MultiSigCredentialRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultiSigRequest(request_id))
+            .expect("MultiSig request not found");
+
+        // Check expiry
+        let now = env.ledger().timestamp();
+        if request.expires_at > 0 {
+            assert!(request.expires_at > now, "MultiSig request has expired");
+        }
+
+        // Issuer must be in required_issuers
+        let is_participant = request.required_issuers.iter().any(|a| a == issuer);
+        assert!(is_participant, "Issuer is not a participant in this request");
+
+        // No duplicate approvals
+        let already_approved = request.approvals.iter().any(|a| a == issuer);
+        assert!(!already_approved, "Issuer has already approved this request");
+
+        request.approvals.push_back(issuer.clone());
+        let approval_count = request.approvals.len() as u32;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MultiSigRequest(request_id), &request);
+
+        env.events().publish(
+            (Symbol::new(&env, "multisig_approval_added"),),
+            (request_id, issuer, approval_count, request.threshold),
+        );
+
+        // Auto-issue when threshold is met
+        if approval_count >= request.threshold {
+            Self::issue_multisig_credential(&env, request_id);
+        }
+    }
+
+    /// Returns the multisig credential request for the given identifier.
+    ///
+    /// Panics if the request does not exist.
+    pub fn get_multisig_request(env: Env, request_id: u64) -> MultiSigCredentialRequest {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MultiSigRequest(request_id))
+            .expect("MultiSig request not found")
+    }
+
+    // --------------------------------------------------------
     // Internal helpers
     // --------------------------------------------------------
 
@@ -1220,6 +1398,105 @@ impl StellarIdContract {
         let base = credential_count * 10;
         let trust_bonus = trust_level / 10;
         (base + trust_bonus).min(1000)
+    }
+
+    /// Internal: issues the credential for a completed multisig request.
+    ///
+    /// Uses the first required issuer as the on-chain `issuer` of the resulting
+    /// credential, which keeps the credential model consistent with single-issuer
+    /// credentials while preserving the full approval record in storage.
+    fn issue_multisig_credential(env: &Env, request_id: u64) {
+        let request: MultiSigCredentialRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultiSigRequest(request_id))
+            .expect("MultiSig request not found");
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CredentialCount)
+            .unwrap_or(0);
+        let credential_id = count + 1;
+
+        let now = env.ledger().timestamp();
+
+        // Use the first required issuer as the canonical issuer address
+        let issuer = request
+            .required_issuers
+            .get(0)
+            .expect("required_issuers is empty");
+
+        let effective_trust = {
+            let rec: Option<Issuer> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Issuer(issuer.clone()));
+            rec.map(|r| r.trust_level).unwrap_or(1)
+        };
+
+        let credential = Credential {
+            id: credential_id,
+            subject: request.subject.clone(),
+            issuer: issuer.clone(),
+            schema_id: request.schema_id,
+            issued_at: now,
+            expires_at: request.expires_at,
+            revoked: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Credential(credential_id), &credential);
+        env.storage()
+            .instance()
+            .set(&DataKey::CredentialCount, &credential_id);
+
+        let mut subject_creds: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SubjectCredentials(request.subject.clone()))
+            .unwrap_or(Vec::new(env));
+        subject_creds.push_back(credential_id);
+        env.storage().persistent().set(
+            &DataKey::SubjectCredentials(request.subject.clone()),
+            &subject_creds,
+        );
+
+        let existing: Option<Identity> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Identity(request.subject.clone()));
+        let identity = if let Some(mut id) = existing {
+            id.credential_count += 1;
+            id.reputation_score = Self::compute_reputation(id.credential_count, effective_trust);
+            id
+        } else {
+            Identity {
+                subject: request.subject.clone(),
+                credential_count: 1,
+                reputation_score: effective_trust / 10,
+                created_at: now,
+            }
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Identity(request.subject.clone()), &identity);
+
+        let mut issuer_rec: Issuer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Issuer(issuer.clone()))
+            .expect("Issuer not found");
+        issuer_rec.credential_count += 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Issuer(issuer.clone()), &issuer_rec);
+
+        env.events().publish(
+            (Symbol::new(env, "multisig_credential_issued"),),
+            (request_id, credential_id, request.subject, request.schema_id),
+        );
     }
 }
 
@@ -2251,5 +2528,223 @@ mod tests {
 
         assert!(!client.verify_commitment(&subject, &schema_id, &cred_id, &bf,));
         assert!(!client.has_valid_commitment(&subject, &schema_id));
+    }
+
+    // --------------------------------------------------------
+    // Multi-issuer (M-of-N) credential request tests
+    // --------------------------------------------------------
+
+    /// Helper: register N issuers and return their addresses.
+    fn register_n_issuers(
+        env: &Env,
+        client: &StellarIdContractClient<'_>,
+        admin: &Address,
+        n: usize,
+    ) -> Vec<Address> {
+        let mut issuers: Vec<Address> = Vec::new(env);
+        for _ in 0..n {
+            issuers.push_back(register_issuer_helper(env, client, admin));
+        }
+        issuers
+    }
+
+    #[test]
+    fn test_multisig_2_of_3_flow() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuers = register_n_issuers(&env, &client, &admin, 3);
+        let schema_id = register_schema_helper(&env, &client, &issuers.get(0).unwrap());
+        let subject = Address::generate(&env);
+
+        // Create a 2-of-3 request; initiator (issuers[0]) auto-approves
+        let request_id = client.create_multisig_request(
+            &issuers.get(0).unwrap(),
+            &subject,
+            &schema_id,
+            &issuers,
+            &2u32,
+            &0u64,
+        );
+
+        // Check request state after creation
+        let req = client.get_multisig_request(&request_id);
+        assert_eq!(req.threshold, 2);
+        assert_eq!(req.approvals.len(), 1);
+        assert_eq!(req.approvals.get(0).unwrap(), issuers.get(0).unwrap());
+        // Threshold not yet met — no credential issued
+        assert_eq!(client.get_credential_count(), 0);
+
+        // Second issuer approves → threshold met → credential auto-issued
+        client.approve_multisig_request(&issuers.get(1).unwrap(), &request_id);
+
+        assert_eq!(client.get_credential_count(), 1);
+        assert!(client.has_valid_credential(&subject, &schema_id));
+
+        let cred = client.get_credential(&1u64);
+        assert_eq!(cred.subject, subject);
+        assert_eq!(cred.schema_id, schema_id);
+        assert!(!cred.revoked);
+    }
+
+    #[test]
+    fn test_multisig_3_of_3_flow() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuers = register_n_issuers(&env, &client, &admin, 3);
+        let schema_id = register_schema_helper(&env, &client, &issuers.get(0).unwrap());
+        let subject = Address::generate(&env);
+
+        // 3-of-3 request
+        let request_id = client.create_multisig_request(
+            &issuers.get(0).unwrap(),
+            &subject,
+            &schema_id,
+            &issuers,
+            &3u32,
+            &0u64,
+        );
+
+        // Only initiator approved so far
+        assert_eq!(client.get_credential_count(), 0);
+
+        // Second approval — still not enough
+        client.approve_multisig_request(&issuers.get(1).unwrap(), &request_id);
+        assert_eq!(client.get_credential_count(), 0);
+
+        // Third approval — threshold met
+        client.approve_multisig_request(&issuers.get(2).unwrap(), &request_id);
+        assert_eq!(client.get_credential_count(), 1);
+        assert!(client.has_valid_credential(&subject, &schema_id));
+    }
+
+    #[test]
+    #[should_panic(expected = "Issuer has already approved this request")]
+    fn test_multisig_duplicate_approval_rejected() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuers = register_n_issuers(&env, &client, &admin, 3);
+        let schema_id = register_schema_helper(&env, &client, &issuers.get(0).unwrap());
+        let subject = Address::generate(&env);
+
+        let request_id = client.create_multisig_request(
+            &issuers.get(0).unwrap(),
+            &subject,
+            &schema_id,
+            &issuers,
+            &3u32,
+            &0u64,
+        );
+
+        // issuers[0] already approved at creation — try again
+        client.approve_multisig_request(&issuers.get(0).unwrap(), &request_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "Issuer is not a participant in this request")]
+    fn test_multisig_non_participant_rejected() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuers = register_n_issuers(&env, &client, &admin, 3);
+        let schema_id = register_schema_helper(&env, &client, &issuers.get(0).unwrap());
+        let subject = Address::generate(&env);
+
+        let request_id = client.create_multisig_request(
+            &issuers.get(0).unwrap(),
+            &subject,
+            &schema_id,
+            &issuers,
+            &2u32,
+            &0u64,
+        );
+
+        // outsider is a registered issuer but not in required_issuers
+        let outsider = register_issuer_helper(&env, &client, &admin);
+        client.approve_multisig_request(&outsider, &request_id);
+    }
+
+    #[test]
+    fn test_multisig_threshold_triggers_issuance_and_identity_update() {
+        let env = Env::default();
+        env.ledger().set_timestamp(2000);
+        let (admin, client) = setup(&env);
+        let issuers = register_n_issuers(&env, &client, &admin, 2);
+        let schema_id = register_schema_helper(&env, &client, &issuers.get(0).unwrap());
+        let subject = Address::generate(&env);
+
+        // No identity yet
+        assert_eq!(client.get_credential_count(), 0);
+
+        let request_id = client.create_multisig_request(
+            &issuers.get(0).unwrap(),
+            &subject,
+            &schema_id,
+            &issuers,
+            &2u32,
+            &3600u64,
+        );
+
+        // Second approval brings us to 2-of-2
+        client.approve_multisig_request(&issuers.get(1).unwrap(), &request_id);
+
+        assert_eq!(client.get_credential_count(), 1);
+
+        let cred = client.get_credential(&1u64);
+        assert_eq!(cred.subject, subject);
+        assert_eq!(cred.expires_at, 2000 + 3600);
+
+        // Identity was created
+        let identity = client.get_identity(&subject);
+        assert_eq!(identity.credential_count, 1);
+        assert_eq!(identity.subject, subject);
+
+        // has_valid_credential respects the issued credential
+        assert!(client.has_valid_credential(&subject, &schema_id));
+    }
+
+    #[test]
+    #[should_panic(expected = "initiator_issuer must be in required_issuers")]
+    fn test_multisig_initiator_not_in_required_issuers_panics() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuers = register_n_issuers(&env, &client, &admin, 3);
+        let outsider = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuers.get(0).unwrap());
+        let subject = Address::generate(&env);
+
+        // outsider is not in issuers list
+        client.create_multisig_request(
+            &outsider,
+            &subject,
+            &schema_id,
+            &issuers,
+            &2u32,
+            &0u64,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "threshold cannot exceed number of required issuers")]
+    fn test_multisig_threshold_exceeds_issuers_panics() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+        let issuers = register_n_issuers(&env, &client, &admin, 2);
+        let schema_id = register_schema_helper(&env, &client, &issuers.get(0).unwrap());
+        let subject = Address::generate(&env);
+
+        // threshold 3 > 2 issuers
+        client.create_multisig_request(
+            &issuers.get(0).unwrap(),
+            &subject,
+            &schema_id,
+            &issuers,
+            &3u32,
+            &0u64,
+        );
     }
 }
