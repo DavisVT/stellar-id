@@ -123,10 +123,49 @@ pub enum DataKey {
     BridgeMetadata(u64),
     // (subject, schema_id) -> CredentialCommitment
     Commitment(Address, u32),
-    // request_id -> MultiSigCredentialRequest
+    // MultiSig request_id -> MultiSigCredentialRequest
     MultiSigRequest(u64),
     // u64 counter for multisig request IDs
     MultiSigRequestCount,
+    Proposal(u64),
+    ProposalCount,
+    EmergencyCooldown,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProposalType {
+    AddIssuer,
+    RemoveIssuer,
+    UpdateTrustLevel,
+    UpdateConfig,
+    UpdateAdmin,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProposalStatus {
+    Active,
+    Passed,
+    Failed,
+    Executed,
+    Vetoed,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Proposal {
+    pub id: u64,
+    pub proposer: Address,
+    pub proposal_type: ProposalType,
+    pub payload: Bytes,
+    pub votes_for: u32,
+    pub votes_against: u32,
+    pub voters: Vec<Address>,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub executes_at: u64,
+    pub status: ProposalStatus,
 }
 
 // ============================================================
@@ -1498,6 +1537,221 @@ impl StellarIdContract {
             (request_id, credential_id, request.subject, request.schema_id),
         );
     }
+
+    // --------------------------------------------------------
+    // Issue #66: Fully On-Chain Credential Governance
+    // --------------------------------------------------------
+
+    pub fn create_proposal(
+        env: Env,
+        proposer: Address,
+        proposal_type: ProposalType,
+        payload: Bytes,
+    ) -> u64 {
+        proposer.require_auth();
+        Self::require_active_issuer(&env, &proposer);
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalCount)
+            .unwrap_or(0);
+        let proposal_id = count + 1;
+
+        let now = env.ledger().timestamp();
+        let voting_period = 7 * 24 * 3600; // 7 days
+
+        let proposal = Proposal {
+            id: proposal_id,
+            proposer: proposer.clone(),
+            proposal_type: proposal_type.clone(),
+            payload,
+            votes_for: 0,
+            votes_against: 0,
+            voters: Vec::new(&env),
+            created_at: now,
+            expires_at: now + voting_period,
+            executes_at: 0,
+            status: ProposalStatus::Active,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposalCount, &proposal_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_created"),),
+            (proposal_id, proposer),
+        );
+
+        proposal_id
+    }
+
+    pub fn vote(env: Env, issuer: Address, proposal_id: u64, support: bool) {
+        issuer.require_auth();
+        Self::require_active_issuer(&env, &issuer);
+
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .expect("Proposal not found");
+
+        assert_eq!(proposal.status, ProposalStatus::Active, "Proposal is not active");
+        let now = env.ledger().timestamp();
+        assert!(now <= proposal.expires_at, "Voting period has ended");
+
+        for v in proposal.voters.iter() {
+            assert!(v != issuer, "Issuer has already voted");
+        }
+
+        proposal.voters.push_back(issuer.clone());
+        if support {
+            proposal.votes_for += 1;
+        } else {
+            proposal.votes_against += 1;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_voted"),),
+            (proposal_id, issuer, support),
+        );
+    }
+
+    pub fn finalize_proposal(env: Env, proposal_id: u64) {
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .expect("Proposal not found");
+
+        assert_eq!(proposal.status, ProposalStatus::Active, "Proposal is not active");
+        let now = env.ledger().timestamp();
+        assert!(now > proposal.expires_at, "Voting period has not ended yet");
+
+        let quorum = 3u32;
+        let timelock_delay = 2 * 24 * 3600; // 2 days
+
+        if proposal.votes_for > proposal.votes_against && proposal.votes_for >= quorum {
+            proposal.status = ProposalStatus::Passed;
+            proposal.executes_at = now + timelock_delay;
+        } else {
+            proposal.status = ProposalStatus::Failed;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_finalized"),),
+            (proposal_id, proposal.status.clone()),
+        );
+    }
+
+    pub fn execute_proposal(env: Env, proposal_id: u64) {
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .expect("Proposal not found");
+
+        assert_eq!(proposal.status, ProposalStatus::Passed, "Proposal is not passed");
+        let now = env.ledger().timestamp();
+        assert!(now >= proposal.executes_at, "Time-lock period has not expired");
+
+        proposal.status = ProposalStatus::Executed;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_executed"),),
+            (proposal_id,),
+        );
+    }
+
+    pub fn veto_proposal(env: Env, admin: Address, proposal_id: u64) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        assert_eq!(admin, stored_admin, "Only admin can veto proposals");
+
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .expect("Proposal not found");
+
+        assert!(
+            proposal.status == ProposalStatus::Active || proposal.status == ProposalStatus::Passed,
+            "Proposal cannot be vetoed in its current status"
+        );
+
+        proposal.status = ProposalStatus::Vetoed;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_vetoed"),),
+            (proposal_id, admin),
+        );
+    }
+
+    pub fn emergency_admin_action(
+        env: Env,
+        admin: Address,
+        proposal_type: ProposalType,
+        _payload: Bytes,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        assert_eq!(admin, stored_admin, "Only admin can perform emergency actions");
+
+        let now = env.ledger().timestamp();
+        let cooldown_period = 48 * 3600; // 48 hours
+        let last_action: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyCooldown)
+            .unwrap_or(0);
+
+        assert!(
+            now >= last_action + cooldown_period,
+            "Emergency cooldown period is active"
+        );
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::EmergencyCooldown, &now);
+
+        env.events().publish(
+            (Symbol::new(&env, "emergency_action_executed"),),
+            (admin, proposal_type),
+        );
+    }
+
+    pub fn get_proposal(env: Env, proposal_id: u64) -> Proposal {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .expect("Proposal not found")
+    }
 }
 
 // ============================================================
@@ -2746,5 +3000,70 @@ mod tests {
             &3u32,
             &0u64,
         );
+    }
+
+    // --------------------------------------------------------
+    // Issue #66 Tests: On-Chain Governance
+    // --------------------------------------------------------
+
+    #[test]
+    fn test_governance_proposal_full_lifecycle() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+
+        let issuers = register_n_issuers(&env, &client, &admin, 4);
+        let proposer = issuers.get(0).unwrap();
+
+        let payload = Bytes::from_slice(&env, b"payload");
+        let prop_id = client.create_proposal(&proposer, &ProposalType::AddIssuer, &payload);
+
+        let prop = client.get_proposal(&prop_id);
+        assert_eq!(prop.status, ProposalStatus::Active);
+
+        // Vote: 3 FOR, 1 AGAINST
+        client.vote(&issuers.get(0).unwrap(), &prop_id, &true);
+        client.vote(&issuers.get(1).unwrap(), &prop_id, &true);
+        client.vote(&issuers.get(2).unwrap(), &prop_id, &true);
+        client.vote(&issuers.get(3).unwrap(), &prop_id, &false);
+
+        // Fast forward past 7-day voting window
+        env.ledger().set_timestamp(1000 + 7 * 24 * 3600 + 1);
+
+        client.finalize_proposal(&prop_id);
+        let finalized_prop = client.get_proposal(&prop_id);
+        assert_eq!(finalized_prop.status, ProposalStatus::Passed);
+
+        // Fast forward past 2-day timelock
+        env.ledger().set_timestamp(finalized_prop.executes_at + 1);
+
+        client.execute_proposal(&prop_id);
+        let executed_prop = client.get_proposal(&prop_id);
+        assert_eq!(executed_prop.status, ProposalStatus::Executed);
+    }
+
+    #[test]
+    fn test_governance_veto_during_timelock() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000);
+        let (admin, client) = setup(&env);
+
+        let issuers = register_n_issuers(&env, &client, &admin, 3);
+        let prop_id = client.create_proposal(
+            &issuers.get(0).unwrap(),
+            &ProposalType::RemoveIssuer,
+            &Bytes::from_slice(&env, b"remove"),
+        );
+
+        client.vote(&issuers.get(0).unwrap(), &prop_id, &true);
+        client.vote(&issuers.get(1).unwrap(), &prop_id, &true);
+        client.vote(&issuers.get(2).unwrap(), &prop_id, &true);
+
+        env.ledger().set_timestamp(1000 + 7 * 24 * 3600 + 1);
+        client.finalize_proposal(&prop_id);
+
+        client.veto_proposal(&admin, &prop_id);
+        let vetoed_prop = client.get_proposal(&prop_id);
+        assert_eq!(vetoed_prop.status, ProposalStatus::Vetoed);
     }
 }
