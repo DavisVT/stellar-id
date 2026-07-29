@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec,
+    contract, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 // ============================================================
@@ -30,6 +30,7 @@ pub struct Credential {
     pub issued_at: u64,
     pub expires_at: u64, // 0 = no expiry
     pub revoked: bool,
+    pub credential_hash: BytesN<32>,
 }
 
 /// A credential schema defining a type of credential
@@ -460,6 +461,15 @@ impl StellarIdContract {
             .unwrap_or(0);
         let credential_id = count + 1;
 
+        let credential_hash = Self::compute_expected_hash(
+            env.clone(),
+            schema_id,
+            subject.clone(),
+            issuer.clone(),
+            now,
+            expires_at,
+        );
+
         let credential = Credential {
             id: credential_id,
             subject: subject.clone(),
@@ -468,6 +478,7 @@ impl StellarIdContract {
             issued_at: now,
             expires_at,
             revoked: false,
+            credential_hash,
         };
 
         env.storage()
@@ -566,6 +577,15 @@ impl StellarIdContract {
             count += 1;
             let credential_id = count;
 
+            let credential_hash = Self::compute_expected_hash(
+                env.clone(),
+                schema_id,
+                subject.clone(),
+                issuer.clone(),
+                now,
+                expires_at,
+            );
+
             let credential = Credential {
                 id: credential_id,
                 subject: subject.clone(),
@@ -574,6 +594,7 @@ impl StellarIdContract {
                 issued_at: now,
                 expires_at,
                 revoked: false,
+                credential_hash,
             };
 
             env.storage()
@@ -689,6 +710,15 @@ impl StellarIdContract {
             0
         };
 
+        let credential_hash = Self::compute_expected_hash(
+            env.clone(),
+            schema_id,
+            subject.clone(),
+            operator.clone(),
+            now,
+            expires_at,
+        );
+
         let credential = Credential {
             id: credential_id,
             subject: subject.clone(),
@@ -697,6 +727,7 @@ impl StellarIdContract {
             issued_at: now,
             expires_at,
             revoked: false,
+            credential_hash,
         };
 
         env.storage()
@@ -1435,6 +1466,15 @@ impl StellarIdContract {
             rec.map(|r| r.trust_level).unwrap_or(1)
         };
 
+        let credential_hash = Self::compute_expected_hash(
+            env.clone(),
+            request.schema_id,
+            request.subject.clone(),
+            issuer.clone(),
+            now,
+            request.expires_at,
+        );
+
         let credential = Credential {
             id: credential_id,
             subject: request.subject.clone(),
@@ -1443,6 +1483,7 @@ impl StellarIdContract {
             issued_at: now,
             expires_at: request.expires_at,
             revoked: false,
+            credential_hash,
         };
 
         env.storage()
@@ -1497,6 +1538,76 @@ impl StellarIdContract {
             (Symbol::new(env, "multisig_credential_issued"),),
             (request_id, credential_id, request.subject, request.schema_id),
         );
+    }
+
+    // --------------------------------------------------------
+    // Issue #64: Credential Hash Registry & EIP-712-style Hashing
+    // --------------------------------------------------------
+
+    pub fn compute_expected_hash(
+        env: Env,
+        schema_id: u32,
+        subject: Address,
+        issuer: Address,
+        issued_at: u64,
+        expires_at: u64,
+    ) -> BytesN<32> {
+        let contract_addr = env.current_contract_address();
+        let contract_bytes = Self::address_to_bytes(&env, &contract_addr);
+
+        let mut domain_buf = Bytes::new(&env);
+        domain_buf.append(&Bytes::from_slice(&env, b"StellarID:v1:"));
+        domain_buf.append(&contract_bytes);
+        let domain_separator = env.crypto().sha256(&domain_buf).to_bytes();
+
+        let mut buf = Bytes::new(&env);
+        buf.append(&Bytes::from_slice(&env, &domain_separator.to_array()));
+        buf.append(&Bytes::from_slice(&env, &schema_id.to_be_bytes()));
+        buf.append(&Self::address_to_bytes(&env, &subject));
+        buf.append(&Self::address_to_bytes(&env, &issuer));
+        buf.append(&Bytes::from_slice(&env, &issued_at.to_be_bytes()));
+        buf.append(&Bytes::from_slice(&env, &expires_at.to_be_bytes()));
+
+        env.crypto().sha256(&buf).to_bytes()
+    }
+
+    pub fn get_credential_hash(env: Env, credential_id: u64) -> BytesN<32> {
+        let cred: Credential = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Credential(credential_id))
+            .expect("Credential not found");
+        cred.credential_hash
+    }
+
+    pub fn verify_credential_hash(env: Env, credential_id: u64) -> bool {
+        let cred: Credential = match env.storage().persistent().get(&DataKey::Credential(credential_id)) {
+            Some(c) => c,
+            None => return false,
+        };
+        let expected = Self::compute_expected_hash(
+            env.clone(),
+            cred.schema_id,
+            cred.subject.clone(),
+            cred.issuer.clone(),
+            cred.issued_at,
+            cred.expires_at,
+        );
+        cred.credential_hash == expected
+    }
+
+    fn address_to_bytes(env: &Env, address: &Address) -> Bytes {
+        let xdr = address.to_xdr(env);
+        if xdr.len() >= 32 {
+            xdr.slice(xdr.len() - 32..xdr.len())
+        } else {
+            let mut b = Bytes::new(env);
+            for _ in 0..(32 - xdr.len()) {
+                b.push_back(0);
+            }
+            b.append(&xdr);
+            b
+        }
     }
 }
 
@@ -2746,5 +2857,55 @@ mod tests {
             &3u32,
             &0u64,
         );
+    }
+
+    // --------------------------------------------------------
+    // Issue #64 Tests: Credential Hash Registry
+    // --------------------------------------------------------
+
+    #[test]
+    fn test_credential_hash_calculation_and_verification() {
+        let env = Env::default();
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &3600);
+        let stored_hash = client.get_credential_hash(&cred_id);
+
+        let cred = client.get_credential(&cred_id);
+        let expected_hash = client.compute_expected_hash(
+            &cred.schema_id,
+            &cred.subject,
+            &cred.issuer,
+            &cred.issued_at,
+            &cred.expires_at,
+        );
+
+        assert_eq!(stored_hash, expected_hash);
+        assert!(client.verify_credential_hash(&cred_id));
+    }
+
+    #[test]
+    fn test_credential_hash_modifying_field_changes_hash() {
+        let env = Env::default();
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &3600);
+        let cred = client.get_credential(&cred_id);
+
+        let tampered_hash = client.compute_expected_hash(
+            &cred.schema_id,
+            &cred.subject,
+            &cred.issuer,
+            &cred.issued_at,
+            &(cred.expires_at + 10),
+        );
+
+        assert_ne!(cred.credential_hash, tampered_hash);
     }
 }
