@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec,
+    contract, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 // ============================================================
@@ -117,7 +117,7 @@ pub enum DataKey {
     BridgeOperator(Address),
     // bridged attestation (chain_id, uid) -> bool
     BridgedAttestation(u64, BytesN<32>),
-    // subject -> Vec<u64> of bridged credential IDs
+    // subject -> Vec<u64> of their bridged credential IDs
     SubjectBridgeCredentials(Address),
     // credential_id -> BridgeAttestation
     BridgeMetadata(u64),
@@ -127,6 +127,10 @@ pub enum DataKey {
     MultiSigRequest(u64),
     // u64 counter for multisig request IDs
     MultiSigRequestCount,
+    // Schema Accumulator (schema_id) -> BytesN<32>
+    SchemaAccumulator(u32),
+    // Schema Holder Count (schema_id) -> u32
+    SchemaHolderCount(u32),
 }
 
 // ============================================================
@@ -470,6 +474,8 @@ impl StellarIdContract {
             revoked: false,
         };
 
+        Self::update_schema_accumulator(&env, schema_id, &subject, true);
+
         env.storage()
             .persistent()
             .set(&DataKey::Credential(credential_id), &credential);
@@ -575,6 +581,8 @@ impl StellarIdContract {
                 expires_at,
                 revoked: false,
             };
+
+            Self::update_schema_accumulator(&env, schema_id, &subject, true);
 
             env.storage()
                 .persistent()
@@ -699,6 +707,8 @@ impl StellarIdContract {
             revoked: false,
         };
 
+        Self::update_schema_accumulator(&env, schema_id, &subject, true);
+
         env.storage()
             .persistent()
             .set(&DataKey::Credential(credential_id), &credential);
@@ -800,6 +810,7 @@ impl StellarIdContract {
         assert!(!credential.revoked, "Credential already revoked");
 
         credential.revoked = true;
+        Self::update_schema_accumulator(&env, credential.schema_id, &credential.subject, false);
         env.storage()
             .persistent()
             .set(&DataKey::Credential(credential_id), &credential);
@@ -1445,6 +1456,8 @@ impl StellarIdContract {
             revoked: false,
         };
 
+        Self::update_schema_accumulator(env, request.schema_id, &request.subject, true);
+
         env.storage()
             .persistent()
             .set(&DataKey::Credential(credential_id), &credential);
@@ -1497,6 +1510,104 @@ impl StellarIdContract {
             (Symbol::new(env, "multisig_credential_issued"),),
             (request_id, credential_id, request.subject, request.schema_id),
         );
+    }
+
+    // --------------------------------------------------------
+    // Issue #65: Privacy-Preserving Identity Aggregator & XOR Accumulator
+    // --------------------------------------------------------
+
+    pub fn get_schema_accumulator(env: Env, schema_id: u32) -> BytesN<32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SchemaAccumulator(schema_id))
+            .unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 32]))
+    }
+
+    pub fn get_schema_holder_count(env: Env, schema_id: u32) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SchemaHolderCount(schema_id))
+            .unwrap_or(0)
+    }
+
+    pub fn generate_membership_witness(
+        env: Env,
+        subject: Address,
+        schema_id: u32,
+    ) -> (BytesN<32>, BytesN<32>) {
+        assert!(
+            Self::has_valid_credential(env.clone(), subject.clone(), schema_id),
+            "Subject does not hold a valid credential for schema"
+        );
+        let subject_b = Self::address_to_bytes(&env, &subject);
+        let subject_hash = env.crypto().sha256(&subject_b).to_bytes();
+        let acc = Self::get_schema_accumulator(env, schema_id);
+        (subject_hash, acc)
+    }
+
+    pub fn verify_membership_witness(
+        env: Env,
+        schema_id: u32,
+        subject_hash: BytesN<32>,
+        accumulator_snapshot: BytesN<32>,
+    ) -> bool {
+        let current_acc = Self::get_schema_accumulator(env.clone(), schema_id);
+        accumulator_snapshot == current_acc && subject_hash != BytesN::from_array(&env, &[0u8; 32])
+    }
+
+    fn address_to_bytes(env: &Env, address: &Address) -> Bytes {
+        let xdr = address.to_xdr(env);
+        if xdr.len() >= 32 {
+            xdr.slice(xdr.len() - 32..xdr.len())
+        } else {
+            let mut b = Bytes::new(env);
+            for _ in 0..(32 - xdr.len()) {
+                b.push_back(0);
+            }
+            b.append(&xdr);
+            b
+        }
+    }
+
+    fn xor_bytes_32(a: &BytesN<32>, b: &BytesN<32>) -> [u8; 32] {
+        let a_arr = a.to_array();
+        let b_arr = b.to_array();
+        let mut res = [0u8; 32];
+        for i in 0..32 {
+            res[i] = a_arr[i] ^ b_arr[i];
+        }
+        res
+    }
+
+    fn update_schema_accumulator(env: &Env, schema_id: u32, subject: &Address, is_issue: bool) {
+        let subject_b = Self::address_to_bytes(env, subject);
+        let subject_hash = env.crypto().sha256(&subject_b).to_bytes();
+        let old_acc: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SchemaAccumulator(schema_id))
+            .unwrap_or_else(|| BytesN::from_array(env, &[0u8; 32]));
+        let xored = Self::xor_bytes_32(&old_acc, &subject_hash);
+        let new_acc = env.crypto().sha256(&Bytes::from_slice(env, &xored)).to_bytes();
+        env.storage()
+            .persistent()
+            .set(&DataKey::SchemaAccumulator(schema_id), &new_acc);
+
+        let current_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SchemaHolderCount(schema_id))
+            .unwrap_or(0);
+        let new_count = if is_issue {
+            current_count + 1
+        } else if current_count > 0 {
+            current_count - 1
+        } else {
+            0
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::SchemaHolderCount(schema_id), &new_count);
     }
 }
 
@@ -2746,5 +2857,34 @@ mod tests {
             &3u32,
             &0u64,
         );
+    }
+
+    // --------------------------------------------------------
+    // Issue #65 Tests: XOR Accumulator
+    // --------------------------------------------------------
+
+    #[test]
+    fn test_schema_accumulator_issue_and_revoke() {
+        let env = Env::default();
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        let initial_acc = client.get_schema_accumulator(&schema_id);
+        assert_eq!(initial_acc, BytesN::from_array(&env, &[0u8; 32]));
+        assert_eq!(client.get_schema_holder_count(&schema_id), 0);
+
+        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &3600);
+        let acc_after_issue = client.get_schema_accumulator(&schema_id);
+        assert_ne!(initial_acc, acc_after_issue);
+        assert_eq!(client.get_schema_holder_count(&schema_id), 1);
+
+        let (sub_hash, snapshot_acc) = client.generate_membership_witness(&subject, &schema_id);
+        assert_eq!(snapshot_acc, acc_after_issue);
+        assert!(client.verify_membership_witness(&schema_id, &sub_hash, &snapshot_acc));
+
+        client.revoke_credential(&issuer, &cred_id);
+        assert_eq!(client.get_schema_holder_count(&schema_id), 0);
     }
 }
