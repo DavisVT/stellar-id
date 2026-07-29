@@ -123,10 +123,24 @@ pub enum DataKey {
     BridgeMetadata(u64),
     // (subject, schema_id) -> CredentialCommitment
     Commitment(Address, u32),
-    // request_id -> MultiSigCredentialRequest
+    // MultiSig request_id -> MultiSigCredentialRequest
     MultiSigRequest(u64),
     // u64 counter for multisig request IDs
     MultiSigRequestCount,
+    DelegationLink(Address, Address),
+    DelegateChildren(Address),
+    DelegateParent(Address),
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DelegationLink {
+    pub parent: Address,
+    pub delegate: Address,
+    pub max_depth: u32,
+    pub trust_fraction: u32, // in basis points (10000 = 100%)
+    pub created_at: u64,
+    pub revoked: bool,
 }
 
 // ============================================================
@@ -508,15 +522,30 @@ impl StellarIdContract {
             .persistent()
             .set(&DataKey::Identity(subject.clone()), &identity);
 
-        let mut issuer_rec: Issuer = env
+        if let Some(mut issuer_rec) = env
             .storage()
             .persistent()
-            .get(&DataKey::Issuer(issuer.clone()))
-            .expect("Issuer not found");
-        issuer_rec.credential_count += 1;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Issuer(issuer.clone()), &issuer_rec);
+            .get::<DataKey, Issuer>(&DataKey::Issuer(issuer.clone()))
+        {
+            issuer_rec.credential_count += 1;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Issuer(issuer.clone()), &issuer_rec);
+        } else {
+            let chain = Self::resolve_delegation_chain(env.clone(), issuer.clone());
+            if let Some(root_addr) = chain.get(chain.len() - 1) {
+                if let Some(mut root_rec) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, Issuer>(&DataKey::Issuer(root_addr.clone()))
+                {
+                    root_rec.credential_count += 1;
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Issuer(root_addr), &root_rec);
+                }
+            }
+        }
 
         env.events().publish(
             (Symbol::new(&env, "credential_issued"),),
@@ -619,15 +648,30 @@ impl StellarIdContract {
             .instance()
             .set(&DataKey::CredentialCount, &count);
 
-        let mut issuer_rec: Issuer = env
+        if let Some(mut issuer_rec) = env
             .storage()
             .persistent()
-            .get(&DataKey::Issuer(issuer.clone()))
-            .expect("Issuer not found");
-        issuer_rec.credential_count += subjects.len() as u64;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Issuer(issuer.clone()), &issuer_rec);
+            .get::<DataKey, Issuer>(&DataKey::Issuer(issuer.clone()))
+        {
+            issuer_rec.credential_count += subjects.len() as u64;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Issuer(issuer.clone()), &issuer_rec);
+        } else {
+            let chain = Self::resolve_delegation_chain(env.clone(), issuer.clone());
+            if let Some(root_addr) = chain.get(chain.len() - 1) {
+                if let Some(mut root_rec) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, Issuer>(&DataKey::Issuer(root_addr.clone()))
+                {
+                    root_rec.credential_count += subjects.len() as u64;
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Issuer(root_addr), &root_rec);
+                }
+            }
+        }
 
         env.events().publish(
             (Symbol::new(&env, "credentials_batch_issued"),),
@@ -1381,7 +1425,9 @@ impl StellarIdContract {
             assert!(record.active, "Issuer is not active");
             record.trust_level
         } else {
-            panic!("Not a registered issuer");
+            let delegated_trust = Self::compute_delegated_trust(env.clone(), issuer.clone());
+            assert!(delegated_trust > 0, "Not a registered issuer or active delegate");
+            delegated_trust
         }
     }
 
@@ -1497,6 +1543,201 @@ impl StellarIdContract {
             (Symbol::new(env, "multisig_credential_issued"),),
             (request_id, credential_id, request.subject, request.schema_id),
         );
+    }
+
+    // --------------------------------------------------------
+    // Issue #68: Transitive Credential Delegation Chain
+    // --------------------------------------------------------
+
+    pub fn create_delegation(
+        env: Env,
+        parent: Address,
+        delegate: Address,
+        max_depth: u32,
+        trust_fraction: u32,
+    ) {
+        parent.require_auth();
+        assert!(trust_fraction <= 10000, "Trust fraction cannot exceed 10000 (100%)");
+
+        Self::require_active_issuer(&env, &parent);
+
+        // Circular delegation check
+        let parent_chain = Self::resolve_delegation_chain(env.clone(), parent.clone());
+        for p in parent_chain.iter() {
+            assert!(p != delegate, "Circular delegation detected");
+        }
+
+        let now = env.ledger().timestamp();
+        let link = DelegationLink {
+            parent: parent.clone(),
+            delegate: delegate.clone(),
+            max_depth,
+            trust_fraction,
+            created_at: now,
+            revoked: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegationLink(parent.clone(), delegate.clone()), &link);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegateParent(delegate.clone()), &parent);
+
+        let mut children: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegateChildren(parent.clone()))
+            .unwrap_or(Vec::new(&env));
+        children.push_back(delegate.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegateChildren(parent.clone()), &children);
+
+        env.events().publish(
+            (Symbol::new(&env, "delegation_created"),),
+            (parent, delegate, max_depth, trust_fraction),
+        );
+    }
+
+    pub fn resolve_delegation_chain(env: Env, delegate: Address) -> Vec<Address> {
+        let mut chain = Vec::new(&env);
+        let mut curr = delegate;
+
+        while let Some(parent) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::DelegateParent(curr.clone()))
+        {
+            if let Some(link) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, DelegationLink>(&DataKey::DelegationLink(parent.clone(), curr.clone()))
+            {
+                if link.revoked {
+                    break;
+                }
+                chain.push_back(parent.clone());
+                curr = parent;
+            } else {
+                break;
+            }
+        }
+        chain
+    }
+
+    pub fn compute_delegated_trust(env: Env, delegate: Address) -> u32 {
+        let chain = Self::resolve_delegation_chain(env.clone(), delegate.clone());
+        if chain.is_empty() {
+            return 0;
+        }
+
+        let depth = chain.len() as u32;
+
+        let root_issuer_addr = chain.get(chain.len() - 1).unwrap();
+        let root_issuer: Issuer = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::Issuer(root_issuer_addr.clone()))
+        {
+            Some(i) => i,
+            None => return 0,
+        };
+
+        if !root_issuer.active {
+            return 0;
+        }
+
+        let first_parent = chain.get(0).unwrap();
+        let first_link: DelegationLink = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegationLink(first_parent, delegate.clone()))
+        {
+            Some(l) => l,
+            None => return 0,
+        };
+
+        if depth > first_link.max_depth {
+            return 0;
+        }
+
+        let mut current_trust = root_issuer.trust_level as u64;
+        let mut curr_node = delegate;
+
+        for p in chain.iter() {
+            let link: DelegationLink = match env
+                .storage()
+                .persistent()
+                .get(&DataKey::DelegationLink(p.clone(), curr_node.clone()))
+            {
+                Some(l) => l,
+                None => return 0,
+            };
+            if link.revoked {
+                return 0;
+            }
+            current_trust = (current_trust * link.trust_fraction as u64) / 10000;
+            curr_node = p;
+        }
+
+        current_trust as u32
+    }
+
+    pub fn revoke_delegation(env: Env, parent: Address, delegate: Address) {
+        parent.require_auth();
+
+        let mut link: DelegationLink = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegationLink(parent.clone(), delegate.clone()))
+            .expect("Delegation link not found");
+
+        assert!(!link.revoked, "Delegation is already revoked");
+        link.revoked = true;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegationLink(parent.clone(), delegate.clone()), &link);
+
+        Self::recursive_revoke_delegates(&env, &delegate);
+
+        env.events().publish(
+            (Symbol::new(&env, "delegation_revoked"),),
+            (parent, delegate),
+        );
+    }
+
+    fn recursive_revoke_delegates(env: &Env, parent: &Address) {
+        let children: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegateChildren(parent.clone()))
+            .unwrap_or(Vec::new(env));
+
+        for child in children.iter() {
+            if let Some(mut link) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, DelegationLink>(&DataKey::DelegationLink(parent.clone(), child.clone()))
+            {
+                if !link.revoked {
+                    link.revoked = true;
+                    env.storage().persistent().set(
+                        &DataKey::DelegationLink(parent.clone(), child.clone()),
+                        &link,
+                    );
+                    Self::recursive_revoke_delegates(env, &child);
+                }
+            }
+        }
+    }
+
+    pub fn get_delegation_link(env: Env, parent: Address, delegate: Address) -> DelegationLink {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DelegationLink(parent, delegate))
+            .expect("Delegation link not found")
     }
 }
 
@@ -2746,5 +2987,42 @@ mod tests {
             &3u32,
             &0u64,
         );
+    }
+
+    // --------------------------------------------------------
+    // Issue #68 Tests: Delegation Chains
+    // --------------------------------------------------------
+
+    #[test]
+    fn test_delegation_chain_trust_decay_and_revocation() {
+        let env = Env::default();
+        let (admin, client) = setup(&env);
+        let root_issuer = register_issuer_helper(&env, &client, &admin); // trust = 80
+
+        let delegate1 = Address::generate(&env);
+        let delegate2 = Address::generate(&env);
+
+        // Root delegates to delegate1 with 50% trust fraction (5000 bps)
+        client.create_delegation(&root_issuer, &delegate1, &3u32, &5000u32);
+        assert_eq!(client.compute_delegated_trust(&delegate1), 40); // 80 * 50% = 40
+
+        // Delegate1 delegates to delegate2 with 80% trust fraction (8000 bps)
+        client.create_delegation(&delegate1, &delegate2, &3u32, &8000u32);
+        assert_eq!(client.compute_delegated_trust(&delegate2), 32); // 40 * 80% = 32
+
+        // Delegate2 can issue credentials using its delegated trust
+        let schema_id = register_schema_helper(&env, &client, &root_issuer);
+        let subject = Address::generate(&env);
+        let cred_id = client.issue_credential(&delegate2, &subject, &schema_id, &0);
+        let cred = client.get_credential(&cred_id);
+        assert_eq!(cred.issuer, delegate2);
+
+        // Revoking root -> delegate1 link cascades revocation to delegate2
+        client.revoke_delegation(&root_issuer, &delegate1);
+        assert_eq!(client.compute_delegated_trust(&delegate1), 0);
+        assert_eq!(client.compute_delegated_trust(&delegate2), 0);
+
+        let sub_link = client.get_delegation_link(&delegate1, &delegate2);
+        assert!(sub_link.revoked);
     }
 }
