@@ -58,8 +58,8 @@ SubIssuer (persistent storage, keyed by (parent, sub) tuple)
 
 ## Storage Strategy
 
-- `instance()` — used for global counters (CredentialCount, SchemaCount) and Admin
-- `persistent()` — used for all user data (Issuers, Schemas, Credentials, Identities)
+- `instance()` — used for global counters (CredentialCount, SchemaCount, SelectiveCredentialCount) and Admin
+- `persistent()` — used for all user data (Issuers, Schemas, Credentials, Identities, Merkle Credentials)
 
 Persistent storage entries have their own TTL and survive contract upgrades. Instance storage is tied to the contract instance.
 
@@ -75,52 +75,16 @@ Persistent storage entries have their own TTL and survive contract upgrades. Ins
 | `register_schema` | Active issuer only |
 | `issue_credential` | Active registered issuer only |
 | `revoke_credential` | Original issuer only |
-| All `get_*` / `has_*` | Anyone — no auth required |
+| `issue_selective_credential` | Active issuer only |
+| All `get_*` / `has_*` / `verify_*` | Anyone — no auth required |
 
-## Events
+---
 
-| Event | Emitted When |
-|---|---|
-| `issuer_registered` | New issuer approved |
-| `issuer_deactivated` | Issuer disabled |
-| `sub_issuer_authorized` | Sub-issuer delegation granted |
-| `sub_issuer_revoked` | Sub-issuer delegation removed |
-| `schema_registered` | New schema created |
-| `credential_issued` | Credential issued to subject |
-| `credential_revoked` | Credential revoked |
+## Selective Disclosure Proofs (Merkle Trees)
 
-## Reputation Score Formula
+Selective disclosure allows subjects to prove individual credential attributes (e.g. `age: 30`) without revealing other fields.
 
-```
-reputation = min(credential_count × 10 + (trust_level / 10), 1000)
-```
-
-The score increases as more trusted issuers credential the subject. It caps at 1000 to prevent overflow. The score is re-computed on every new credential issuance.
-
-## Credential Commitment Scheme
-
-StellarID credentials are stored in plaintext. The commitment layer lets a subject prove they hold a valid credential without revealing which one.
-
-### How it works
-
-1. **Commit** — the subject picks a random 32-byte blinding factor `r` and computes:
-   ```
-   commitment = SHA-256(credential_id_as_8_le_bytes || r)
-   ```
-   They call `submit_commitment(subject, schema_id, commitment)`. Only the hash goes on-chain.
-
-2. **Prove** — when a verifier calls `verify_commitment(subject, schema_id, credential_id, r)`, the contract recomputes the hash and checks it matches the stored commitment. It also checks the credential is valid (not revoked, not expired, owned by subject).
-
-3. **Query** — `has_valid_commitment(subject, schema_id)` returns whether a commitment exists and the subject holds at least one live credential for that schema, without revealing which credential.
-
-### Security properties
-
-- **Hiding** — SHA-256 is a one-way function; the commitment reveals nothing about `credential_id` or `r`.
-- **Binding** — it is computationally infeasible to find a different `(credential_id', r')` that produces the same commitment.
-- **Privacy** — observers on-chain see only the hash, not the credential ID or issuer.
-
-### Limitations
-
-- `has_valid_commitment` is a weaker guarantee than `verify_commitment`. It confirms a commitment exists and a live credential exists for the schema, but does not bind the two together. Full binding requires the subject to reveal the opening via `verify_commitment`.
-- The commitment is per `(subject, schema_id)`. Submitting again overwrites the previous commitment.
-
+### Merkle Tree Specification
+- **Leaf Hash**: `SHA-256( field_name_xdr || ASCII(":") || field_value_xdr )`
+- **Internal Nodes**: Binary Merkle tree combining adjacent pairs: `SHA-256( left || right )`. Odd leaf layers duplicate the last leaf.
+- **Proof Verification**: `verify_credential_field` recomputes the Merkle path and verifies against `merkle_root` stored on `SelectiveCredential`.

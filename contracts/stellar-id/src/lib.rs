@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec,
+    contract, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 // ============================================================
@@ -32,6 +32,21 @@ pub struct Credential {
     pub revoked: bool,
 }
 
+/// A selective disclosure credential using Merkle trees
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SelectiveCredential {
+    pub id: u64,
+    pub subject: Address,
+    pub issuer: Address,
+    pub schema_id: u32,
+    pub merkle_root: BytesN<32>,
+    pub field_count: u32,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub revoked: bool,
+}
+
 /// A credential schema defining a type of credential
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -43,7 +58,7 @@ pub struct Schema {
     pub active: bool,
 }
 
-/// An issuer registered in the system
+/// An entity authorized to issue credentials
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Issuer {
@@ -54,19 +69,19 @@ pub struct Issuer {
     pub credential_count: u64,
 }
 
-/// On-chain identity profile for a subject
+/// A subject identity record tracked on-chain
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Identity {
     pub subject: Address,
     pub credential_count: u32,
-    pub reputation_score: u32, // derived from credential count + issuer trust
+    pub reputation_score: u32,
     pub created_at: u64,
 }
 
-/// A privacy-preserving commitment to a credential.
+/// A commitment to a credential stored on-chain.
 ///
-/// The commitment is computed off-chain as SHA-256(credential_id_le || blinding_factor)
+/// Created by taking `SHA-256(credential_id || blinding_factor)` off-chain
 /// and submitted on-chain. The subject can later prove knowledge of the opening
 /// without revealing which specific credential or issuer is involved.
 #[contracttype]
@@ -127,6 +142,8 @@ pub enum DataKey {
     MultiSigRequest(u64),
     // u64 counter for multisig request IDs
     MultiSigRequestCount,
+    SelectiveCredential(u64),
+    SelectiveCredentialCount,
 }
 
 // ============================================================
@@ -1498,6 +1515,194 @@ impl StellarIdContract {
             (request_id, credential_id, request.subject, request.schema_id),
         );
     }
+
+    // --------------------------------------------------------
+    // Issue #67: Selective Disclosure Merkle Proofs
+    // --------------------------------------------------------
+
+    pub fn hash_leaf(env: Env, field_name: String, field_value: String) -> BytesN<32> {
+        let mut buf = Bytes::new(&env);
+        buf.append(&field_name.to_xdr(&env));
+        buf.append(&Bytes::from_slice(&env, b":"));
+        buf.append(&field_value.to_xdr(&env));
+        env.crypto().sha256(&buf).to_bytes()
+    }
+
+    pub fn compute_merkle_root(env: Env, leaves: Vec<BytesN<32>>) -> BytesN<32> {
+        assert!(!leaves.is_empty(), "Leaves vector cannot be empty");
+        let mut current = leaves;
+
+        while current.len() > 1 {
+            let mut next = Vec::new(&env);
+            if current.len() % 2 != 0 {
+                let last = current.get(current.len() - 1).unwrap();
+                current.push_back(last);
+            }
+            let pairs = current.len() / 2;
+            for i in 0..pairs {
+                let left = current.get(2 * i).unwrap();
+                let right = current.get(2 * i + 1).unwrap();
+                let mut buf = Bytes::new(&env);
+                buf.append(&Bytes::from_slice(&env, &left.to_array()));
+                buf.append(&Bytes::from_slice(&env, &right.to_array()));
+                next.push_back(env.crypto().sha256(&buf).to_bytes());
+            }
+            current = next;
+        }
+
+        current.get(0).unwrap()
+    }
+
+    pub fn verify_merkle_proof(
+        env: Env,
+        leaf: BytesN<32>,
+        proof: Vec<BytesN<32>>,
+        root: BytesN<32>,
+        index: u32,
+    ) -> bool {
+        let mut current_hash = leaf;
+        let mut idx = index;
+
+        for p in proof.iter() {
+            let mut buf = Bytes::new(&env);
+            if idx % 2 == 0 {
+                buf.append(&Bytes::from_slice(&env, &current_hash.to_array()));
+                buf.append(&Bytes::from_slice(&env, &p.to_array()));
+            } else {
+                buf.append(&Bytes::from_slice(&env, &p.to_array()));
+                buf.append(&Bytes::from_slice(&env, &current_hash.to_array()));
+            }
+            current_hash = env.crypto().sha256(&buf).to_bytes();
+            idx /= 2;
+        }
+
+        current_hash == root
+    }
+
+    pub fn issue_selective_credential(
+        env: Env,
+        issuer: Address,
+        subject: Address,
+        schema_id: u32,
+        merkle_root: BytesN<32>,
+        field_count: u32,
+        duration: u64,
+    ) -> u64 {
+        issuer.require_auth();
+        Self::require_active_issuer(&env, &issuer);
+        Self::require_active_schema(&env, schema_id);
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SelectiveCredentialCount)
+            .unwrap_or(0);
+        let id = count + 1;
+
+        let now = env.ledger().timestamp();
+        let expires_at = if duration > 0 { now + duration } else { 0 };
+
+        let sel_cred = SelectiveCredential {
+            id,
+            subject: subject.clone(),
+            issuer: issuer.clone(),
+            schema_id,
+            merkle_root,
+            field_count,
+            issued_at: now,
+            expires_at,
+            revoked: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SelectiveCredential(id), &sel_cred);
+        env.storage()
+            .instance()
+            .set(&DataKey::SelectiveCredentialCount, &id);
+
+        env.events().publish(
+            (Symbol::new(&env, "selective_credential_issued"),),
+            (id, subject, issuer, schema_id),
+        );
+
+        id
+    }
+
+    pub fn get_selective_credential(env: Env, id: u64) -> SelectiveCredential {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SelectiveCredential(id))
+            .expect("Selective credential not found")
+    }
+
+    pub fn verify_credential_field(
+        env: Env,
+        credential_id: u64,
+        field_name: String,
+        field_value: String,
+        proof: Vec<BytesN<32>>,
+        index: u32,
+    ) -> bool {
+        let cred: SelectiveCredential = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::SelectiveCredential(credential_id))
+        {
+            Some(c) => c,
+            None => return false,
+        };
+
+        if cred.revoked {
+            return false;
+        }
+
+        let now = env.ledger().timestamp();
+        if cred.expires_at > 0 && now > cred.expires_at {
+            return false;
+        }
+
+        let leaf_hash = Self::hash_leaf(env.clone(), field_name, field_value);
+        Self::verify_merkle_proof(env, leaf_hash, proof, cred.merkle_root, index)
+    }
+
+    pub fn has_valid_field(
+        env: Env,
+        subject: Address,
+        schema_id: u32,
+        field_name: String,
+        field_value: String,
+        proof: Vec<BytesN<32>>,
+        index: u32,
+    ) -> bool {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SelectiveCredentialCount)
+            .unwrap_or(0);
+
+        for id in 1..=count {
+            if let Some(cred) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, SelectiveCredential>(&DataKey::SelectiveCredential(id))
+            {
+                if cred.subject == subject && cred.schema_id == schema_id {
+                    if Self::verify_credential_field(
+                        env.clone(),
+                        id,
+                        field_name.clone(),
+                        field_value.clone(),
+                        proof.clone(),
+                        index,
+                    ) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
 }
 
 // ============================================================
@@ -2746,5 +2951,55 @@ mod tests {
             &3u32,
             &0u64,
         );
+    }
+
+    // --------------------------------------------------------
+    // Issue #67 Tests: Selective Disclosure Merkle Proofs
+    // --------------------------------------------------------
+
+    #[test]
+    fn test_selective_disclosure_merkle_tree() {
+        let env = Env::default();
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
+
+        let leaf0 = client.hash_leaf(&String::from_str(&env, "name"), &String::from_str(&env, "Alice"));
+        let leaf1 = client.hash_leaf(&String::from_str(&env, "age"), &String::from_str(&env, "30"));
+        let leaf2 = client.hash_leaf(&String::from_str(&env, "country"), &String::from_str(&env, "US"));
+        let leaf3 = client.hash_leaf(&String::from_str(&env, "role"), &String::from_str(&env, "admin"));
+
+        let mut leaves = Vec::new(&env);
+        leaves.push_back(leaf0.clone());
+        leaves.push_back(leaf1.clone());
+        leaves.push_back(leaf2.clone());
+        leaves.push_back(leaf3.clone());
+
+        let root = client.compute_merkle_root(&leaves);
+
+        let sel_id = client.issue_selective_credential(&issuer, &subject, &schema_id, &root, &4u32, &3600u64);
+        let sel_cred = client.get_selective_credential(&sel_id);
+        assert_eq!(sel_cred.merkle_root, root);
+
+        // Proof for leaf 1 ("age", "30") at index 1
+        let mut proof1 = Vec::new(&env);
+        proof1.push_back(leaf0.clone());
+        let right_sub = {
+            let mut b = Bytes::new(&env);
+            b.append(&Bytes::from_slice(&env, &leaf2.to_array()));
+            b.append(&Bytes::from_slice(&env, &leaf3.to_array()));
+            env.crypto().sha256(&b).to_bytes()
+        };
+        proof1.push_back(right_sub);
+
+        let valid = client.verify_credential_field(
+            &sel_id,
+            &String::from_str(&env, "age"),
+            &String::from_str(&env, "30"),
+            &proof1,
+            &1u32,
+        );
+        assert!(valid);
     }
 }
