@@ -74,7 +74,7 @@ Persistent storage entries have their own TTL and survive contract upgrades. Ins
 | `authorize_sub_issuer` | Parent issuer only |
 | `revoke_sub_issuer` | Parent issuer only |
 | `register_schema` | Active issuer only |
-| `issue_credential` | Active registered issuer only |
+| `issue_credential` | Active registered/delegated issuer only |
 | `revoke_credential` | Original issuer only |
 | `create_proposal` | Active registered issuer only |
 | `vote` | Active registered issuer only |
@@ -86,21 +86,19 @@ Persistent storage entries have their own TTL and survive contract upgrades. Ins
 
 ---
 
-| Event | Emitted When |
-|---|---|
-| `issuer_registered` | New issuer approved |
-| `issuer_deactivated` | Issuer disabled |
-| `sub_issuer_authorized` | Sub-issuer delegation granted |
-| `sub_issuer_revoked` | Sub-issuer delegation removed |
-| `schema_registered` | New schema created |
-| `credential_issued` | Credential issued to subject |
-| `credential_revoked` | Credential revoked |
+## Transitive Credential Delegation Chain
 
-## Reputation Score Formula
+StellarID supports multi-hop hierarchical delegation chains with depth limits and trust decay.
 
+### Delegation Link
+A `DelegationLink` defines `(parent, delegate, max_depth, trust_fraction)`.
+
+### Trust Decay Calculation
+Trust decays across delegate hops using fixed-point integer math:
 ```
-reputation = min(credential_count × 10 + (trust_level / 10), 1000)
+delegated_trust = (root_trust × fraction_1 / 10000 × fraction_2 / 10000 × ... × fraction_k / 10000)
 ```
+where `trust_fraction` is expressed in basis points (max 10,000 = 100%).
 
 The score increases as more trusted issuers credential the subject. It caps at 1000 to prevent overflow. The score is re-computed on every new credential issuance.
 
