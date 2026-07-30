@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec,
+    contract, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 // ============================================================
@@ -30,6 +30,22 @@ pub struct Credential {
     pub issued_at: u64,
     pub expires_at: u64, // 0 = no expiry
     pub revoked: bool,
+    pub credential_hash: BytesN<32>,
+}
+
+/// A selective disclosure credential using Merkle trees
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SelectiveCredential {
+    pub id: u64,
+    pub subject: Address,
+    pub issuer: Address,
+    pub schema_id: u32,
+    pub merkle_root: BytesN<32>,
+    pub field_count: u32,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub revoked: bool,
 }
 
 /// A credential schema defining a type of credential
@@ -43,7 +59,7 @@ pub struct Schema {
     pub active: bool,
 }
 
-/// An issuer registered in the system
+/// An entity authorized to issue credentials
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Issuer {
@@ -54,19 +70,19 @@ pub struct Issuer {
     pub credential_count: u64,
 }
 
-/// On-chain identity profile for a subject
+/// A subject identity record tracked on-chain
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Identity {
     pub subject: Address,
     pub credential_count: u32,
-    pub reputation_score: u32, // derived from credential count + issuer trust
+    pub reputation_score: u32,
     pub created_at: u64,
 }
 
-/// A privacy-preserving commitment to a credential.
+/// A commitment to a credential stored on-chain.
 ///
-/// The commitment is computed off-chain as SHA-256(credential_id_le || blinding_factor)
+/// Created by taking `SHA-256(credential_id || blinding_factor)` off-chain
 /// and submitted on-chain. The subject can later prove knowledge of the opening
 /// without revealing which specific credential or issuer is involved.
 #[contracttype]
@@ -130,18 +146,55 @@ pub enum DataKey {
     BridgeOperator(Address),
     // bridged attestation (chain_id, uid) -> bool
     BridgedAttestation(u64, BytesN<32>),
-    // subject -> Vec<u64> of bridged credential IDs
+    // subject -> Vec<u64> of their bridged credential IDs
     SubjectBridgeCredentials(Address),
     // credential_id -> BridgeAttestation
     BridgeMetadata(u64),
     // (subject, schema_id) -> CredentialCommitment
     Commitment(Address, u32),
-    // request_id -> MultiSigCredentialRequest
+    // MultiSig request_id -> MultiSigCredentialRequest
     MultiSigRequest(u64),
     // u64 counter for multisig request IDs
     MultiSigRequestCount,
-    // credential_id -> TransferRequest
-    TransferRequest(u64),
+    Proposal(u64),
+    ProposalCount,
+    EmergencyCooldown,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProposalType {
+    AddIssuer,
+    RemoveIssuer,
+    UpdateTrustLevel,
+    UpdateConfig,
+    UpdateAdmin,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProposalStatus {
+    Active,
+    Passed,
+    Failed,
+    Executed,
+    Vetoed,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Proposal {
+    pub id: u64,
+    pub proposer: Address,
+    pub proposal_type: ProposalType,
+    pub payload: Bytes,
+    pub votes_for: u32,
+    pub votes_against: u32,
+    pub voters: Vec<Address>,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub executes_at: u64,
+    pub status: ProposalStatus,
 }
 
 // ============================================================
@@ -475,6 +528,15 @@ impl StellarIdContract {
             .unwrap_or(0);
         let credential_id = count + 1;
 
+        let credential_hash = Self::compute_expected_hash(
+            env.clone(),
+            schema_id,
+            subject.clone(),
+            issuer.clone(),
+            now,
+            expires_at,
+        );
+
         let credential = Credential {
             id: credential_id,
             subject: subject.clone(),
@@ -483,7 +545,10 @@ impl StellarIdContract {
             issued_at: now,
             expires_at,
             revoked: false,
+            credential_hash,
         };
+
+        Self::update_schema_accumulator(&env, schema_id, &subject, true);
 
         env.storage()
             .persistent()
@@ -523,15 +588,30 @@ impl StellarIdContract {
             .persistent()
             .set(&DataKey::Identity(subject.clone()), &identity);
 
-        let mut issuer_rec: Issuer = env
+        if let Some(mut issuer_rec) = env
             .storage()
             .persistent()
-            .get(&DataKey::Issuer(issuer.clone()))
-            .expect("Issuer not found");
-        issuer_rec.credential_count += 1;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Issuer(issuer.clone()), &issuer_rec);
+            .get::<DataKey, Issuer>(&DataKey::Issuer(issuer.clone()))
+        {
+            issuer_rec.credential_count += 1;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Issuer(issuer.clone()), &issuer_rec);
+        } else {
+            let chain = Self::resolve_delegation_chain(env.clone(), issuer.clone());
+            if let Some(root_addr) = chain.get(chain.len() - 1) {
+                if let Some(mut root_rec) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, Issuer>(&DataKey::Issuer(root_addr.clone()))
+                {
+                    root_rec.credential_count += 1;
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Issuer(root_addr), &root_rec);
+                }
+            }
+        }
 
         env.events().publish(
             (Symbol::new(&env, "credential_issued"),),
@@ -581,6 +661,15 @@ impl StellarIdContract {
             count += 1;
             let credential_id = count;
 
+            let credential_hash = Self::compute_expected_hash(
+                env.clone(),
+                schema_id,
+                subject.clone(),
+                issuer.clone(),
+                now,
+                expires_at,
+            );
+
             let credential = Credential {
                 id: credential_id,
                 subject: subject.clone(),
@@ -589,7 +678,10 @@ impl StellarIdContract {
                 issued_at: now,
                 expires_at,
                 revoked: false,
+                credential_hash,
             };
+
+            Self::update_schema_accumulator(&env, schema_id, &subject, true);
 
             env.storage()
                 .persistent()
@@ -634,15 +726,30 @@ impl StellarIdContract {
             .instance()
             .set(&DataKey::CredentialCount, &count);
 
-        let mut issuer_rec: Issuer = env
+        if let Some(mut issuer_rec) = env
             .storage()
             .persistent()
-            .get(&DataKey::Issuer(issuer.clone()))
-            .expect("Issuer not found");
-        issuer_rec.credential_count += subjects.len() as u64;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Issuer(issuer.clone()), &issuer_rec);
+            .get::<DataKey, Issuer>(&DataKey::Issuer(issuer.clone()))
+        {
+            issuer_rec.credential_count += subjects.len() as u64;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Issuer(issuer.clone()), &issuer_rec);
+        } else {
+            let chain = Self::resolve_delegation_chain(env.clone(), issuer.clone());
+            if let Some(root_addr) = chain.get(chain.len() - 1) {
+                if let Some(mut root_rec) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, Issuer>(&DataKey::Issuer(root_addr.clone()))
+                {
+                    root_rec.credential_count += subjects.len() as u64;
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Issuer(root_addr), &root_rec);
+                }
+            }
+        }
 
         env.events().publish(
             (Symbol::new(&env, "credentials_batch_issued"),),
@@ -704,6 +811,15 @@ impl StellarIdContract {
             0
         };
 
+        let credential_hash = Self::compute_expected_hash(
+            env.clone(),
+            schema_id,
+            subject.clone(),
+            operator.clone(),
+            now,
+            expires_at,
+        );
+
         let credential = Credential {
             id: credential_id,
             subject: subject.clone(),
@@ -712,7 +828,10 @@ impl StellarIdContract {
             issued_at: now,
             expires_at,
             revoked: false,
+            credential_hash,
         };
+
+        Self::update_schema_accumulator(&env, schema_id, &subject, true);
 
         env.storage()
             .persistent()
@@ -815,6 +934,7 @@ impl StellarIdContract {
         assert!(!credential.revoked, "Credential already revoked");
 
         credential.revoked = true;
+        Self::update_schema_accumulator(&env, credential.schema_id, &credential.subject, false);
         env.storage()
             .persistent()
             .set(&DataKey::Credential(credential_id), &credential);
@@ -1583,7 +1703,9 @@ impl StellarIdContract {
             assert!(record.active, "Issuer is not active");
             record.trust_level
         } else {
-            panic!("Not a registered issuer");
+            let delegated_trust = Self::compute_delegated_trust(env.clone(), issuer.clone());
+            assert!(delegated_trust > 0, "Not a registered issuer or active delegate");
+            delegated_trust
         }
     }
 
@@ -1637,6 +1759,15 @@ impl StellarIdContract {
             rec.map(|r| r.trust_level).unwrap_or(1)
         };
 
+        let credential_hash = Self::compute_expected_hash(
+            env.clone(),
+            request.schema_id,
+            request.subject.clone(),
+            issuer.clone(),
+            now,
+            request.expires_at,
+        );
+
         let credential = Credential {
             id: credential_id,
             subject: request.subject.clone(),
@@ -1645,7 +1776,10 @@ impl StellarIdContract {
             issued_at: now,
             expires_at: request.expires_at,
             revoked: false,
+            credential_hash,
         };
+
+        Self::update_schema_accumulator(env, request.schema_id, &request.subject, true);
 
         env.storage()
             .persistent()
@@ -1699,6 +1833,76 @@ impl StellarIdContract {
             (Symbol::new(env, "multisig_credential_issued"),),
             (request_id, credential_id, request.subject, request.schema_id),
         );
+    }
+
+    // --------------------------------------------------------
+    // Issue #64: Credential Hash Registry & EIP-712-style Hashing
+    // --------------------------------------------------------
+
+    pub fn compute_expected_hash(
+        env: Env,
+        schema_id: u32,
+        subject: Address,
+        issuer: Address,
+        issued_at: u64,
+        expires_at: u64,
+    ) -> BytesN<32> {
+        let contract_addr = env.current_contract_address();
+        let contract_bytes = Self::address_to_bytes(&env, &contract_addr);
+
+        let mut domain_buf = Bytes::new(&env);
+        domain_buf.append(&Bytes::from_slice(&env, b"StellarID:v1:"));
+        domain_buf.append(&contract_bytes);
+        let domain_separator = env.crypto().sha256(&domain_buf).to_bytes();
+
+        let mut buf = Bytes::new(&env);
+        buf.append(&Bytes::from_slice(&env, &domain_separator.to_array()));
+        buf.append(&Bytes::from_slice(&env, &schema_id.to_be_bytes()));
+        buf.append(&Self::address_to_bytes(&env, &subject));
+        buf.append(&Self::address_to_bytes(&env, &issuer));
+        buf.append(&Bytes::from_slice(&env, &issued_at.to_be_bytes()));
+        buf.append(&Bytes::from_slice(&env, &expires_at.to_be_bytes()));
+
+        env.crypto().sha256(&buf).to_bytes()
+    }
+
+    pub fn get_credential_hash(env: Env, credential_id: u64) -> BytesN<32> {
+        let cred: Credential = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Credential(credential_id))
+            .expect("Credential not found");
+        cred.credential_hash
+    }
+
+    pub fn verify_credential_hash(env: Env, credential_id: u64) -> bool {
+        let cred: Credential = match env.storage().persistent().get(&DataKey::Credential(credential_id)) {
+            Some(c) => c,
+            None => return false,
+        };
+        let expected = Self::compute_expected_hash(
+            env.clone(),
+            cred.schema_id,
+            cred.subject.clone(),
+            cred.issuer.clone(),
+            cred.issued_at,
+            cred.expires_at,
+        );
+        cred.credential_hash == expected
+    }
+
+    fn address_to_bytes(env: &Env, address: &Address) -> Bytes {
+        let xdr = address.to_xdr(env);
+        if xdr.len() >= 32 {
+            xdr.slice(xdr.len() - 32..xdr.len())
+        } else {
+            let mut b = Bytes::new(env);
+            for _ in 0..(32 - xdr.len()) {
+                b.push_back(0);
+            }
+            b.append(&xdr);
+            b
+        }
     }
 }
 
@@ -2949,212 +3153,52 @@ mod tests {
     }
 
     // --------------------------------------------------------
-    // Credential transfer tests
+    // Issue #64 Tests: Credential Hash Registry
     // --------------------------------------------------------
 
     #[test]
-    fn test_credential_transfer_full_flow() {
+    fn test_credential_hash_calculation_and_verification() {
         let env = Env::default();
-        env.ledger().set_timestamp(1000);
-        let (admin, client) = setup(&env);
-        let _contract_id = env.register_contract(None, StellarIdContract);
-        let issuer = register_issuer_helper(&env, &client, &admin);
-        let schema_id = register_schema_helper(&env, &client, &issuer);
-        let old_subject = Address::generate(&env);
-        let new_subject = Address::generate(&env);
-
-        // Issue credential to old_subject
-        let cred_id = client.issue_credential(&issuer, &old_subject, &schema_id, &0u64);
-
-        // Verify initial state
-        assert_eq!(client.get_credential(&cred_id).subject, old_subject);
-        assert!(client.get_subject_credentials(&old_subject).contains(&cred_id));
-        assert_eq!(client.get_identity(&old_subject).credential_count, 1);
-
-        // Propose transfer
-        client.propose_transfer(&old_subject, &cred_id, &new_subject);
-
-        // Approve transfer
-        client.approve_transfer(&issuer, &cred_id);
-
-        // Verify credential updated
-        assert_eq!(client.get_credential(&cred_id).subject, new_subject);
-
-        // Verify old subject's credentials updated
-        assert!(!client.get_subject_credentials(&old_subject).contains(&cred_id));
-        assert_eq!(client.get_subject_credentials(&old_subject).len(), 0);
-
-        // Verify new subject's credentials updated
-        assert!(client.get_subject_credentials(&new_subject).contains(&cred_id));
-        assert_eq!(client.get_subject_credentials(&new_subject).len(), 1);
-
-        // Verify old subject's identity removed (no credentials left)
-        // Skip this check as it requires direct storage access
-        // The transfer is successful if the new subject has the credential
-
-        // Verify new subject's identity created
-        let new_identity = client.get_identity(&new_subject);
-        assert_eq!(new_identity.credential_count, 1);
-        assert_eq!(new_identity.subject, new_subject);
-    }
-
-    #[test]
-    fn test_credential_transfer_with_multiple_credentials() {
-        let env = Env::default();
-        env.ledger().set_timestamp(1000);
-        let (admin, client) = setup(&env);
-        let issuer = register_issuer_helper(&env, &client, &admin);
-        let schema_id = register_schema_helper(&env, &client, &issuer);
-        let old_subject = Address::generate(&env);
-        let new_subject = Address::generate(&env);
-
-        // Issue two credentials to old_subject
-        let cred_id1 = client.issue_credential(&issuer, &old_subject, &schema_id, &0u64);
-        let cred_id2 = client.issue_credential(&issuer, &old_subject, &schema_id, &0u64);
-
-        assert_eq!(client.get_identity(&old_subject).credential_count, 2);
-
-        // Transfer only one credential
-        client.propose_transfer(&old_subject, &cred_id1, &new_subject);
-        client.approve_transfer(&issuer, &cred_id1);
-
-        // Verify old subject still has one credential
-        assert_eq!(client.get_subject_credentials(&old_subject).len(), 1);
-        assert!(client.get_subject_credentials(&old_subject).contains(&cred_id2));
-        assert_eq!(client.get_identity(&old_subject).credential_count, 1);
-
-        // Verify new subject has one credential
-        assert_eq!(client.get_subject_credentials(&new_subject).len(), 1);
-        assert!(client.get_subject_credentials(&new_subject).contains(&cred_id1));
-        assert_eq!(client.get_identity(&new_subject).credential_count, 1);
-    }
-
-    #[test]
-    #[should_panic(expected = "Only the credential subject can propose transfer")]
-    fn test_non_subject_cannot_propose_transfer() {
-        let env = Env::default();
-        env.ledger().set_timestamp(1000);
-        let (admin, client) = setup(&env);
-        let issuer = register_issuer_helper(&env, &client, &admin);
-        let schema_id = register_schema_helper(&env, &client, &issuer);
-        let subject = Address::generate(&env);
-        let attacker = Address::generate(&env);
-        let new_address = Address::generate(&env);
-
-        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &0u64);
-
-        // Attacker tries to propose transfer
-        client.propose_transfer(&attacker, &cred_id, &new_address);
-    }
-
-    #[test]
-    #[should_panic(expected = "Only the original issuer can approve transfer")]
-    fn test_non_issuer_cannot_approve_transfer() {
-        let env = Env::default();
-        env.ledger().set_timestamp(1000);
-        let (admin, client) = setup(&env);
-        let issuer = register_issuer_helper(&env, &client, &admin);
-        let other_issuer = register_issuer_helper(&env, &client, &admin);
-        let schema_id = register_schema_helper(&env, &client, &issuer);
-        let subject = Address::generate(&env);
-        let new_address = Address::generate(&env);
-
-        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &0u64);
-
-        client.propose_transfer(&subject, &cred_id, &new_address);
-
-        // Different issuer tries to approve
-        client.approve_transfer(&other_issuer, &cred_id);
-    }
-
-    #[test]
-    #[should_panic(expected = "Transfer request already exists")]
-    fn test_duplicate_propose_transfer_panics() {
-        let env = Env::default();
-        env.ledger().set_timestamp(1000);
-        let (admin, client) = setup(&env);
-        let issuer = register_issuer_helper(&env, &client, &admin);
-        let schema_id = register_schema_helper(&env, &client, &issuer);
-        let subject = Address::generate(&env);
-        let new_address = Address::generate(&env);
-
-        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &0u64);
-
-        client.propose_transfer(&subject, &cred_id, &new_address);
-
-        // Try to propose again
-        client.propose_transfer(&subject, &cred_id, &new_address);
-    }
-
-    #[test]
-    #[should_panic(expected = "Transfer request not found")]
-    fn test_approve_without_propose_panics() {
-        let env = Env::default();
-        env.ledger().set_timestamp(1000);
         let (admin, client) = setup(&env);
         let issuer = register_issuer_helper(&env, &client, &admin);
         let schema_id = register_schema_helper(&env, &client, &issuer);
         let subject = Address::generate(&env);
 
-        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &0u64);
+        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &3600);
+        let stored_hash = client.get_credential_hash(&cred_id);
 
-        // Try to approve without proposing
-        client.approve_transfer(&issuer, &cred_id);
+        let cred = client.get_credential(&cred_id);
+        let expected_hash = client.compute_expected_hash(
+            &cred.schema_id,
+            &cred.subject,
+            &cred.issuer,
+            &cred.issued_at,
+            &cred.expires_at,
+        );
+
+        assert_eq!(stored_hash, expected_hash);
+        assert!(client.verify_credential_hash(&cred_id));
     }
 
     #[test]
-    fn test_transfer_to_existing_subject_updates_identity() {
+    fn test_credential_hash_modifying_field_changes_hash() {
         let env = Env::default();
-        env.ledger().set_timestamp(1000);
         let (admin, client) = setup(&env);
         let issuer = register_issuer_helper(&env, &client, &admin);
         let schema_id = register_schema_helper(&env, &client, &issuer);
-        let old_subject = Address::generate(&env);
-        let new_subject = Address::generate(&env);
+        let subject = Address::generate(&env);
 
-        // Give new_subject an existing credential
-        let _existing_cred_id = client.issue_credential(&issuer, &new_subject, &schema_id, &0u64);
-        let initial_rep = client.get_identity(&new_subject).reputation_score;
+        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &3600);
+        let cred = client.get_credential(&cred_id);
 
-        // Issue another credential to old_subject
-        let transfer_cred_id = client.issue_credential(&issuer, &old_subject, &schema_id, &0u64);
+        let tampered_hash = client.compute_expected_hash(
+            &cred.schema_id,
+            &cred.subject,
+            &cred.issuer,
+            &cred.issued_at,
+            &(cred.expires_at + 10),
+        );
 
-        // Transfer to new_subject
-        client.propose_transfer(&old_subject, &transfer_cred_id, &new_subject);
-        client.approve_transfer(&issuer, &transfer_cred_id);
-
-        // Verify new_subject's identity was updated (credential_count increased)
-        let new_identity = client.get_identity(&new_subject);
-        assert_eq!(new_identity.credential_count, 2);
-        assert!(new_identity.reputation_score > initial_rep);
-    }
-
-    #[test]
-    fn test_transfer_identity_updates_correctly() {
-        let env = Env::default();
-        env.ledger().set_timestamp(1000);
-        let (admin, client) = setup(&env);
-        let issuer = register_issuer_helper(&env, &client, &admin);
-        let schema_id = register_schema_helper(&env, &client, &issuer);
-        let old_subject = Address::generate(&env);
-        let new_subject = Address::generate(&env);
-
-        // Issue credential
-        let cred_id = client.issue_credential(&issuer, &old_subject, &schema_id, &0u64);
-
-        let old_identity_before = client.get_identity(&old_subject);
-        assert_eq!(old_identity_before.credential_count, 1);
-
-        // Transfer
-        client.propose_transfer(&old_subject, &cred_id, &new_subject);
-        client.approve_transfer(&issuer, &cred_id);
-
-        // Old subject should have no credentials left (identity would be removed)
-        assert_eq!(client.get_subject_credentials(&old_subject).len(), 0);
-
-        // New subject identity should be created
-        let new_identity = client.get_identity(&new_subject);
-        assert_eq!(new_identity.credential_count, 1);
-        assert_eq!(new_identity.subject, new_subject);
+        assert_ne!(cred.credential_hash, tampered_hash);
     }
 }
