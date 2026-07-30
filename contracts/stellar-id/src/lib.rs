@@ -30,6 +30,7 @@ pub struct Credential {
     pub issued_at: u64,
     pub expires_at: u64, // 0 = no expiry
     pub revoked: bool,
+    pub credential_hash: BytesN<32>,
 }
 
 /// A credential schema defining a type of credential
@@ -464,6 +465,15 @@ impl StellarIdContract {
             .unwrap_or(0);
         let credential_id = count + 1;
 
+        let credential_hash = Self::compute_expected_hash(
+            env.clone(),
+            schema_id,
+            subject.clone(),
+            issuer.clone(),
+            now,
+            expires_at,
+        );
+
         let credential = Credential {
             id: credential_id,
             subject: subject.clone(),
@@ -472,6 +482,7 @@ impl StellarIdContract {
             issued_at: now,
             expires_at,
             revoked: false,
+            credential_hash,
         };
 
         Self::update_schema_accumulator(&env, schema_id, &subject, true);
@@ -572,6 +583,15 @@ impl StellarIdContract {
             count += 1;
             let credential_id = count;
 
+            let credential_hash = Self::compute_expected_hash(
+                env.clone(),
+                schema_id,
+                subject.clone(),
+                issuer.clone(),
+                now,
+                expires_at,
+            );
+
             let credential = Credential {
                 id: credential_id,
                 subject: subject.clone(),
@@ -580,6 +600,7 @@ impl StellarIdContract {
                 issued_at: now,
                 expires_at,
                 revoked: false,
+                credential_hash,
             };
 
             Self::update_schema_accumulator(&env, schema_id, &subject, true);
@@ -697,6 +718,15 @@ impl StellarIdContract {
             0
         };
 
+        let credential_hash = Self::compute_expected_hash(
+            env.clone(),
+            schema_id,
+            subject.clone(),
+            operator.clone(),
+            now,
+            expires_at,
+        );
+
         let credential = Credential {
             id: credential_id,
             subject: subject.clone(),
@@ -705,6 +735,7 @@ impl StellarIdContract {
             issued_at: now,
             expires_at,
             revoked: false,
+            credential_hash,
         };
 
         Self::update_schema_accumulator(&env, schema_id, &subject, true);
@@ -1446,6 +1477,15 @@ impl StellarIdContract {
             rec.map(|r| r.trust_level).unwrap_or(1)
         };
 
+        let credential_hash = Self::compute_expected_hash(
+            env.clone(),
+            request.schema_id,
+            request.subject.clone(),
+            issuer.clone(),
+            now,
+            request.expires_at,
+        );
+
         let credential = Credential {
             id: credential_id,
             subject: request.subject.clone(),
@@ -1454,6 +1494,7 @@ impl StellarIdContract {
             issued_at: now,
             expires_at: request.expires_at,
             revoked: false,
+            credential_hash,
         };
 
         Self::update_schema_accumulator(env, request.schema_id, &request.subject, true);
@@ -1513,46 +1554,59 @@ impl StellarIdContract {
     }
 
     // --------------------------------------------------------
-    // Issue #65: Privacy-Preserving Identity Aggregator & XOR Accumulator
+    // Issue #64: Credential Hash Registry & EIP-712-style Hashing
     // --------------------------------------------------------
 
-    pub fn get_schema_accumulator(env: Env, schema_id: u32) -> BytesN<32> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::SchemaAccumulator(schema_id))
-            .unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 32]))
-    }
-
-    pub fn get_schema_holder_count(env: Env, schema_id: u32) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::SchemaHolderCount(schema_id))
-            .unwrap_or(0)
-    }
-
-    pub fn generate_membership_witness(
+    pub fn compute_expected_hash(
         env: Env,
+        schema_id: u32,
         subject: Address,
-        schema_id: u32,
-    ) -> (BytesN<32>, BytesN<32>) {
-        assert!(
-            Self::has_valid_credential(env.clone(), subject.clone(), schema_id),
-            "Subject does not hold a valid credential for schema"
-        );
-        let subject_b = Self::address_to_bytes(&env, &subject);
-        let subject_hash = env.crypto().sha256(&subject_b).to_bytes();
-        let acc = Self::get_schema_accumulator(env, schema_id);
-        (subject_hash, acc)
+        issuer: Address,
+        issued_at: u64,
+        expires_at: u64,
+    ) -> BytesN<32> {
+        let contract_addr = env.current_contract_address();
+        let contract_bytes = Self::address_to_bytes(&env, &contract_addr);
+
+        let mut domain_buf = Bytes::new(&env);
+        domain_buf.append(&Bytes::from_slice(&env, b"StellarID:v1:"));
+        domain_buf.append(&contract_bytes);
+        let domain_separator = env.crypto().sha256(&domain_buf).to_bytes();
+
+        let mut buf = Bytes::new(&env);
+        buf.append(&Bytes::from_slice(&env, &domain_separator.to_array()));
+        buf.append(&Bytes::from_slice(&env, &schema_id.to_be_bytes()));
+        buf.append(&Self::address_to_bytes(&env, &subject));
+        buf.append(&Self::address_to_bytes(&env, &issuer));
+        buf.append(&Bytes::from_slice(&env, &issued_at.to_be_bytes()));
+        buf.append(&Bytes::from_slice(&env, &expires_at.to_be_bytes()));
+
+        env.crypto().sha256(&buf).to_bytes()
     }
 
-    pub fn verify_membership_witness(
-        env: Env,
-        schema_id: u32,
-        subject_hash: BytesN<32>,
-        accumulator_snapshot: BytesN<32>,
-    ) -> bool {
-        let current_acc = Self::get_schema_accumulator(env.clone(), schema_id);
-        accumulator_snapshot == current_acc && subject_hash != BytesN::from_array(&env, &[0u8; 32])
+    pub fn get_credential_hash(env: Env, credential_id: u64) -> BytesN<32> {
+        let cred: Credential = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Credential(credential_id))
+            .expect("Credential not found");
+        cred.credential_hash
+    }
+
+    pub fn verify_credential_hash(env: Env, credential_id: u64) -> bool {
+        let cred: Credential = match env.storage().persistent().get(&DataKey::Credential(credential_id)) {
+            Some(c) => c,
+            None => return false,
+        };
+        let expected = Self::compute_expected_hash(
+            env.clone(),
+            cred.schema_id,
+            cred.subject.clone(),
+            cred.issuer.clone(),
+            cred.issued_at,
+            cred.expires_at,
+        );
+        cred.credential_hash == expected
     }
 
     fn address_to_bytes(env: &Env, address: &Address) -> Bytes {
@@ -1567,47 +1621,6 @@ impl StellarIdContract {
             b.append(&xdr);
             b
         }
-    }
-
-    fn xor_bytes_32(a: &BytesN<32>, b: &BytesN<32>) -> [u8; 32] {
-        let a_arr = a.to_array();
-        let b_arr = b.to_array();
-        let mut res = [0u8; 32];
-        for i in 0..32 {
-            res[i] = a_arr[i] ^ b_arr[i];
-        }
-        res
-    }
-
-    fn update_schema_accumulator(env: &Env, schema_id: u32, subject: &Address, is_issue: bool) {
-        let subject_b = Self::address_to_bytes(env, subject);
-        let subject_hash = env.crypto().sha256(&subject_b).to_bytes();
-        let old_acc: BytesN<32> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::SchemaAccumulator(schema_id))
-            .unwrap_or_else(|| BytesN::from_array(env, &[0u8; 32]));
-        let xored = Self::xor_bytes_32(&old_acc, &subject_hash);
-        let new_acc = env.crypto().sha256(&Bytes::from_slice(env, &xored)).to_bytes();
-        env.storage()
-            .persistent()
-            .set(&DataKey::SchemaAccumulator(schema_id), &new_acc);
-
-        let current_count: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::SchemaHolderCount(schema_id))
-            .unwrap_or(0);
-        let new_count = if is_issue {
-            current_count + 1
-        } else if current_count > 0 {
-            current_count - 1
-        } else {
-            0
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::SchemaHolderCount(schema_id), &new_count);
     }
 }
 
@@ -2860,31 +2873,52 @@ mod tests {
     }
 
     // --------------------------------------------------------
-    // Issue #65 Tests: XOR Accumulator
+    // Issue #64 Tests: Credential Hash Registry
     // --------------------------------------------------------
 
     #[test]
-    fn test_schema_accumulator_issue_and_revoke() {
+    fn test_credential_hash_calculation_and_verification() {
         let env = Env::default();
         let (admin, client) = setup(&env);
         let issuer = register_issuer_helper(&env, &client, &admin);
         let schema_id = register_schema_helper(&env, &client, &issuer);
         let subject = Address::generate(&env);
 
-        let initial_acc = client.get_schema_accumulator(&schema_id);
-        assert_eq!(initial_acc, BytesN::from_array(&env, &[0u8; 32]));
-        assert_eq!(client.get_schema_holder_count(&schema_id), 0);
+        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &3600);
+        let stored_hash = client.get_credential_hash(&cred_id);
+
+        let cred = client.get_credential(&cred_id);
+        let expected_hash = client.compute_expected_hash(
+            &cred.schema_id,
+            &cred.subject,
+            &cred.issuer,
+            &cred.issued_at,
+            &cred.expires_at,
+        );
+
+        assert_eq!(stored_hash, expected_hash);
+        assert!(client.verify_credential_hash(&cred_id));
+    }
+
+    #[test]
+    fn test_credential_hash_modifying_field_changes_hash() {
+        let env = Env::default();
+        let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
 
         let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &3600);
-        let acc_after_issue = client.get_schema_accumulator(&schema_id);
-        assert_ne!(initial_acc, acc_after_issue);
-        assert_eq!(client.get_schema_holder_count(&schema_id), 1);
+        let cred = client.get_credential(&cred_id);
 
-        let (sub_hash, snapshot_acc) = client.generate_membership_witness(&subject, &schema_id);
-        assert_eq!(snapshot_acc, acc_after_issue);
-        assert!(client.verify_membership_witness(&schema_id, &sub_hash, &snapshot_acc));
+        let tampered_hash = client.compute_expected_hash(
+            &cred.schema_id,
+            &cred.subject,
+            &cred.issuer,
+            &cred.issued_at,
+            &(cred.expires_at + 10),
+        );
 
-        client.revoke_credential(&issuer, &cred_id);
-        assert_eq!(client.get_schema_holder_count(&schema_id), 0);
+        assert_ne!(cred.credential_hash, tampered_hash);
     }
 }

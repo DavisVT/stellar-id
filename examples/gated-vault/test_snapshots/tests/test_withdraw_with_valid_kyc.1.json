@@ -290,6 +290,14 @@
                   "map": [
                     {
                       "key": {
+                        "symbol": "credential_hash"
+                      },
+                      "val": {
+                        "bytes": "3d5dbe74e7837eb6afa204db85c6c76e35f8f3b3abb3784c6993e2a6c0bbc27f"
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "expires_at"
                       },
                       "val": {

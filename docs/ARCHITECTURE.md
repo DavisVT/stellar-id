@@ -42,7 +42,8 @@ Credential (persistent storage, keyed by credential_id u64)
   ├── schema_id
   ├── issued_at
   ├── expires_at (0 = no expiry)
-  └── revoked
+  ├── revoked
+  └── credential_hash (BytesN<32>)
 
 Identity (persistent storage, keyed by subject Address)
   ├── credential_count
@@ -90,10 +91,33 @@ acc_0 = 0x00...00 (32 bytes of 0s)
 acc_k = SHA-256( acc_{k-1} XOR SHA-256(subject_bytes) )
 ```
 
-### Verification & Witness
-- `generate_membership_witness(env, subject, schema_id)` returns `(subject_hash, accumulator)`.
-- `verify_membership_witness(env, schema_id, subject_hash, snapshot)` verifies whether `subject_hash` matches an active credential holder at `snapshot`.
-- `get_schema_holder_count(env, schema_id)` exposes total active holder count without revealing wallet addresses.
+The score increases as more trusted issuers credential the subject. It caps at 1000 to prevent overflow. The score is re-computed on every new credential issuance.
 
-### Limitations
-This scheme relies on snapshot consistency. Off-chain verifiers should request recent accumulator snapshots to verify membership.
+## Credential Commitment Scheme
+
+StellarID credentials are stored in plaintext. The commitment layer lets a subject prove they hold a valid credential without revealing which one.
+
+---
+
+## Canonical Credential Hashing Standard (EIP-712 Style)
+
+Credential authenticity in StellarID supports off-chain verification using an EIP-712-style deterministic typed structured data hashing scheme.
+
+### Domain Separator
+```
+domain_separator = SHA-256( ASCII("StellarID:v1:") || contract_address_32_bytes )
+```
+
+### Credential Encoding
+```
+credential_hash = SHA-256(
+    domain_separator (32 bytes) ||
+    schema_id (4 bytes big-endian u32) ||
+    subject_address (32 bytes) ||
+    issuer_address (32 bytes) ||
+    issued_at (8 bytes big-endian u64) ||
+    expires_at (8 bytes big-endian u64)
+)
+```
+
+All field byte encodings are fixed-width big-endian values. Address values are converted into 32-byte fixed representation. Off-chain verifiers can reproduce this hash using the issuer's public key and credential metadata without querying Stellar.
