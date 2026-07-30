@@ -133,7 +133,7 @@ pub enum DataKey {
     BridgeOperator(Address),
     // bridged attestation (chain_id, uid) -> bool
     BridgedAttestation(u64, BytesN<32>),
-    // subject -> Vec<u64> of bridged credential IDs
+    // subject -> Vec<u64> of their bridged credential IDs
     SubjectBridgeCredentials(Address),
     // credential_id -> BridgeAttestation
     BridgeMetadata(u64),
@@ -535,6 +535,8 @@ impl StellarIdContract {
             credential_hash,
         };
 
+        Self::update_schema_accumulator(&env, schema_id, &subject, true);
+
         env.storage()
             .persistent()
             .set(&DataKey::Credential(credential_id), &credential);
@@ -665,6 +667,8 @@ impl StellarIdContract {
                 revoked: false,
                 credential_hash,
             };
+
+            Self::update_schema_accumulator(&env, schema_id, &subject, true);
 
             env.storage()
                 .persistent()
@@ -814,6 +818,8 @@ impl StellarIdContract {
             credential_hash,
         };
 
+        Self::update_schema_accumulator(&env, schema_id, &subject, true);
+
         env.storage()
             .persistent()
             .set(&DataKey::Credential(credential_id), &credential);
@@ -915,6 +921,7 @@ impl StellarIdContract {
         assert!(!credential.revoked, "Credential already revoked");
 
         credential.revoked = true;
+        Self::update_schema_accumulator(&env, credential.schema_id, &credential.subject, false);
         env.storage()
             .persistent()
             .set(&DataKey::Credential(credential_id), &credential);
@@ -1571,6 +1578,8 @@ impl StellarIdContract {
             revoked: false,
             credential_hash,
         };
+
+        Self::update_schema_accumulator(env, request.schema_id, &request.subject, true);
 
         env.storage()
             .persistent()
