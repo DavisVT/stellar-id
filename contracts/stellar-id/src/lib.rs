@@ -124,10 +124,49 @@ pub enum DataKey {
     BridgeMetadata(u64),
     // (subject, schema_id) -> CredentialCommitment
     Commitment(Address, u32),
-    // request_id -> MultiSigCredentialRequest
+    // MultiSig request_id -> MultiSigCredentialRequest
     MultiSigRequest(u64),
     // u64 counter for multisig request IDs
     MultiSigRequestCount,
+    Proposal(u64),
+    ProposalCount,
+    EmergencyCooldown,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProposalType {
+    AddIssuer,
+    RemoveIssuer,
+    UpdateTrustLevel,
+    UpdateConfig,
+    UpdateAdmin,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProposalStatus {
+    Active,
+    Passed,
+    Failed,
+    Executed,
+    Vetoed,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Proposal {
+    pub id: u64,
+    pub proposer: Address,
+    pub proposal_type: ProposalType,
+    pub payload: Bytes,
+    pub votes_for: u32,
+    pub votes_against: u32,
+    pub voters: Vec<Address>,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub executes_at: u64,
+    pub status: ProposalStatus,
 }
 
 // ============================================================
