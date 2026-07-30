@@ -221,6 +221,14 @@
                   "map": [
                     {
                       "key": {
+                        "symbol": "credential_hash"
+                      },
+                      "val": {
+                        "bytes": "f48a63c61e655c2136dbbfac1456d532aacfd8d3107042d0c966756a29a01d98"
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "expires_at"
                       },
                       "val": {
@@ -1099,7 +1107,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'Only the original issuer can revoke' from contract function 'Symbol(obj#241)'"
+                  "string": "caught panic 'Only the original issuer can revoke' from contract function 'Symbol(obj#291)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"

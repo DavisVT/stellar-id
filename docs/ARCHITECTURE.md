@@ -42,7 +42,8 @@ Credential (persistent storage, keyed by credential_id u64)
   ├── schema_id
   ├── issued_at
   ├── expires_at (0 = no expiry)
-  └── revoked
+  ├── revoked
+  └── credential_hash (BytesN<32>)
 
 Identity (persistent storage, keyed by subject Address)
   ├── credential_count
@@ -101,26 +102,27 @@ The score increases as more trusted issuers credential the subject. It caps at 1
 
 StellarID credentials are stored in plaintext. The commitment layer lets a subject prove they hold a valid credential without revealing which one.
 
-### How it works
+---
 
-1. **Commit** — the subject picks a random 32-byte blinding factor `r` and computes:
-   ```
-   commitment = SHA-256(credential_id_as_8_le_bytes || r)
-   ```
-   They call `submit_commitment(subject, schema_id, commitment)`. Only the hash goes on-chain.
+## Canonical Credential Hashing Standard (EIP-712 Style)
 
-2. **Prove** — when a verifier calls `verify_commitment(subject, schema_id, credential_id, r)`, the contract recomputes the hash and checks it matches the stored commitment. It also checks the credential is valid (not revoked, not expired, owned by subject).
+Credential authenticity in StellarID supports off-chain verification using an EIP-712-style deterministic typed structured data hashing scheme.
 
-3. **Query** — `has_valid_commitment(subject, schema_id)` returns whether a commitment exists and the subject holds at least one live credential for that schema, without revealing which credential.
+### Domain Separator
+```
+domain_separator = SHA-256( ASCII("StellarID:v1:") || contract_address_32_bytes )
+```
 
-### Security properties
+### Credential Encoding
+```
+credential_hash = SHA-256(
+    domain_separator (32 bytes) ||
+    schema_id (4 bytes big-endian u32) ||
+    subject_address (32 bytes) ||
+    issuer_address (32 bytes) ||
+    issued_at (8 bytes big-endian u64) ||
+    expires_at (8 bytes big-endian u64)
+)
+```
 
-- **Hiding** — SHA-256 is a one-way function; the commitment reveals nothing about `credential_id` or `r`.
-- **Binding** — it is computationally infeasible to find a different `(credential_id', r')` that produces the same commitment.
-- **Privacy** — observers on-chain see only the hash, not the credential ID or issuer.
-
-### Limitations
-
-- `has_valid_commitment` is a weaker guarantee than `verify_commitment`. It confirms a commitment exists and a live credential exists for the schema, but does not bind the two together. Full binding requires the subject to reveal the opening via `verify_commitment`.
-- The commitment is per `(subject, schema_id)`. Submitting again overwrites the previous commitment.
-
+All field byte encodings are fixed-width big-endian values. Address values are converted into 32-byte fixed representation. Off-chain verifiers can reproduce this hash using the issuer's public key and credential metadata without querying Stellar.
