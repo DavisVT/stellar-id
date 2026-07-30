@@ -33,6 +33,21 @@ pub struct Credential {
     pub credential_hash: BytesN<32>,
 }
 
+/// A selective disclosure credential using Merkle trees
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SelectiveCredential {
+    pub id: u64,
+    pub subject: Address,
+    pub issuer: Address,
+    pub schema_id: u32,
+    pub merkle_root: BytesN<32>,
+    pub field_count: u32,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub revoked: bool,
+}
+
 /// A credential schema defining a type of credential
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -44,7 +59,7 @@ pub struct Schema {
     pub active: bool,
 }
 
-/// An issuer registered in the system
+/// An entity authorized to issue credentials
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Issuer {
@@ -55,19 +70,19 @@ pub struct Issuer {
     pub credential_count: u64,
 }
 
-/// On-chain identity profile for a subject
+/// A subject identity record tracked on-chain
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Identity {
     pub subject: Address,
     pub credential_count: u32,
-    pub reputation_score: u32, // derived from credential count + issuer trust
+    pub reputation_score: u32,
     pub created_at: u64,
 }
 
-/// A privacy-preserving commitment to a credential.
+/// A commitment to a credential stored on-chain.
 ///
-/// The commitment is computed off-chain as SHA-256(credential_id_le || blinding_factor)
+/// Created by taking `SHA-256(credential_id || blinding_factor)` off-chain
 /// and submitted on-chain. The subject can later prove knowledge of the opening
 /// without revealing which specific credential or issuer is involved.
 #[contracttype]
@@ -560,15 +575,30 @@ impl StellarIdContract {
             .persistent()
             .set(&DataKey::Identity(subject.clone()), &identity);
 
-        let mut issuer_rec: Issuer = env
+        if let Some(mut issuer_rec) = env
             .storage()
             .persistent()
-            .get(&DataKey::Issuer(issuer.clone()))
-            .expect("Issuer not found");
-        issuer_rec.credential_count += 1;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Issuer(issuer.clone()), &issuer_rec);
+            .get::<DataKey, Issuer>(&DataKey::Issuer(issuer.clone()))
+        {
+            issuer_rec.credential_count += 1;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Issuer(issuer.clone()), &issuer_rec);
+        } else {
+            let chain = Self::resolve_delegation_chain(env.clone(), issuer.clone());
+            if let Some(root_addr) = chain.get(chain.len() - 1) {
+                if let Some(mut root_rec) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, Issuer>(&DataKey::Issuer(root_addr.clone()))
+                {
+                    root_rec.credential_count += 1;
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Issuer(root_addr), &root_rec);
+                }
+            }
+        }
 
         env.events().publish(
             (Symbol::new(&env, "credential_issued"),),
@@ -683,15 +713,30 @@ impl StellarIdContract {
             .instance()
             .set(&DataKey::CredentialCount, &count);
 
-        let mut issuer_rec: Issuer = env
+        if let Some(mut issuer_rec) = env
             .storage()
             .persistent()
-            .get(&DataKey::Issuer(issuer.clone()))
-            .expect("Issuer not found");
-        issuer_rec.credential_count += subjects.len() as u64;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Issuer(issuer.clone()), &issuer_rec);
+            .get::<DataKey, Issuer>(&DataKey::Issuer(issuer.clone()))
+        {
+            issuer_rec.credential_count += subjects.len() as u64;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Issuer(issuer.clone()), &issuer_rec);
+        } else {
+            let chain = Self::resolve_delegation_chain(env.clone(), issuer.clone());
+            if let Some(root_addr) = chain.get(chain.len() - 1) {
+                if let Some(mut root_rec) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, Issuer>(&DataKey::Issuer(root_addr.clone()))
+                {
+                    root_rec.credential_count += subjects.len() as u64;
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Issuer(root_addr), &root_rec);
+                }
+            }
+        }
 
         env.events().publish(
             (Symbol::new(&env, "credentials_batch_issued"),),
@@ -1458,7 +1503,9 @@ impl StellarIdContract {
             assert!(record.active, "Issuer is not active");
             record.trust_level
         } else {
-            panic!("Not a registered issuer");
+            let delegated_trust = Self::compute_delegated_trust(env.clone(), issuer.clone());
+            assert!(delegated_trust > 0, "Not a registered issuer or active delegate");
+            delegated_trust
         }
     }
 

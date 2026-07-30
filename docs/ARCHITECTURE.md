@@ -74,7 +74,7 @@ Persistent storage entries have their own TTL and survive contract upgrades. Ins
 | `authorize_sub_issuer` | Parent issuer only |
 | `revoke_sub_issuer` | Parent issuer only |
 | `register_schema` | Active issuer only |
-| `issue_credential` | Active registered issuer only |
+| `issue_credential` | Active registered/delegated issuer only |
 | `revoke_credential` | Original issuer only |
 | `create_proposal` | Active registered issuer only |
 | `vote` | Active registered issuer only |
@@ -86,16 +86,19 @@ Persistent storage entries have their own TTL and survive contract upgrades. Ins
 
 ---
 
-## Anonymous XOR Accumulator & Membership Proofs
+## Transitive Credential Delegation Chain
 
-StellarID maintains a privacy-preserving cryptographic accumulator for each credential schema.
+StellarID supports multi-hop hierarchical delegation chains with depth limits and trust decay.
 
-### Accumulator Formula
-For a set of credential holders `{addr1, addr2, ..., addrN}`:
+### Delegation Link
+A `DelegationLink` defines `(parent, delegate, max_depth, trust_fraction)`.
+
+### Trust Decay Calculation
+Trust decays across delegate hops using fixed-point integer math:
 ```
-acc_0 = 0x00...00 (32 bytes of 0s)
-acc_k = SHA-256( acc_{k-1} XOR SHA-256(subject_bytes) )
+delegated_trust = (root_trust × fraction_1 / 10000 × fraction_2 / 10000 × ... × fraction_k / 10000)
 ```
+where `trust_fraction` is expressed in basis points (max 10,000 = 100%).
 
 The score increases as more trusted issuers credential the subject. It caps at 1000 to prevent overflow. The score is re-computed on every new credential issuance.
 
