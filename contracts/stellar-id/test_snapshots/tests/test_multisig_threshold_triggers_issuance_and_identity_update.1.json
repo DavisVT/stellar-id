@@ -321,6 +321,14 @@
                   "map": [
                     {
                       "key": {
+                        "symbol": "credential_hash"
+                      },
+                      "val": {
+                        "bytes": "d89d81e65e1f7c765b010a96de8a4c6cec8abc7137efec948dc338be542abad9"
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "expires_at"
                       },
                       "val": {
@@ -1766,6 +1774,14 @@
             ],
             "data": {
               "map": [
+                {
+                  "key": {
+                    "symbol": "credential_hash"
+                  },
+                  "val": {
+                    "bytes": "d89d81e65e1f7c765b010a96de8a4c6cec8abc7137efec948dc338be542abad9"
+                  }
+                },
                 {
                   "key": {
                     "symbol": "expires_at"

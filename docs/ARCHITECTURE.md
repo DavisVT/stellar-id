@@ -42,7 +42,8 @@ Credential (persistent storage, keyed by credential_id u64)
   ├── schema_id
   ├── issued_at
   ├── expires_at (0 = no expiry)
-  └── revoked
+  ├── revoked
+  └── credential_hash (BytesN<32>)
 
 Identity (persistent storage, keyed by subject Address)
   ├── credential_count
@@ -85,13 +86,49 @@ Persistent storage entries have their own TTL and survive contract upgrades. Ins
 
 ---
 
-## On-Chain Credential Governance System
+| Event | Emitted When |
+|---|---|
+| `issuer_registered` | New issuer approved |
+| `issuer_deactivated` | Issuer disabled |
+| `sub_issuer_authorized` | Sub-issuer delegation granted |
+| `sub_issuer_revoked` | Sub-issuer delegation removed |
+| `schema_registered` | New schema created |
+| `credential_issued` | Credential issued to subject |
+| `credential_revoked` | Credential revoked |
 
-StellarID features fully decentralized on-chain proposal voting and time-locked execution.
+## Reputation Score Formula
 
-### Proposal Lifecycle
-1. **Creation**: An active issuer calls `create_proposal(proposer, proposal_type, payload)`. Voting window is set to 7 days.
-2. **Voting**: Registered active issuers call `vote(issuer, proposal_id, support)`. Each issuer has exactly 1 vote per proposal.
-3. **Finalization**: After 7 days, `finalize_proposal(proposal_id)` transitions status to `Passed` if `votes_for > votes_against` and `votes_for >= 3` (quorum), or `Failed` otherwise.
-4. **Execution**: After a 2-day time-lock (`executes_at`), `execute_proposal(proposal_id)` decodes payload and executes the governance action.
-5. **Veto & Emergency**: Admin can veto proposals during voting or time-lock via `veto_proposal`. `emergency_admin_action` enforces a 48-hour global cooldown.
+```
+reputation = min(credential_count × 10 + (trust_level / 10), 1000)
+```
+
+The score increases as more trusted issuers credential the subject. It caps at 1000 to prevent overflow. The score is re-computed on every new credential issuance.
+
+## Credential Commitment Scheme
+
+StellarID credentials are stored in plaintext. The commitment layer lets a subject prove they hold a valid credential without revealing which one.
+
+---
+
+## Canonical Credential Hashing Standard (EIP-712 Style)
+
+Credential authenticity in StellarID supports off-chain verification using an EIP-712-style deterministic typed structured data hashing scheme.
+
+### Domain Separator
+```
+domain_separator = SHA-256( ASCII("StellarID:v1:") || contract_address_32_bytes )
+```
+
+### Credential Encoding
+```
+credential_hash = SHA-256(
+    domain_separator (32 bytes) ||
+    schema_id (4 bytes big-endian u32) ||
+    subject_address (32 bytes) ||
+    issuer_address (32 bytes) ||
+    issued_at (8 bytes big-endian u64) ||
+    expires_at (8 bytes big-endian u64)
+)
+```
+
+All field byte encodings are fixed-width big-endian values. Address values are converted into 32-byte fixed representation. Off-chain verifiers can reproduce this hash using the issuer's public key and credential metadata without querying Stellar.

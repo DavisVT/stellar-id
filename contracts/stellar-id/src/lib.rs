@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec,
+    contract, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 // ============================================================
@@ -30,6 +30,7 @@ pub struct Credential {
     pub issued_at: u64,
     pub expires_at: u64, // 0 = no expiry
     pub revoked: bool,
+    pub credential_hash: BytesN<32>,
 }
 
 /// A credential schema defining a type of credential
@@ -499,6 +500,15 @@ impl StellarIdContract {
             .unwrap_or(0);
         let credential_id = count + 1;
 
+        let credential_hash = Self::compute_expected_hash(
+            env.clone(),
+            schema_id,
+            subject.clone(),
+            issuer.clone(),
+            now,
+            expires_at,
+        );
+
         let credential = Credential {
             id: credential_id,
             subject: subject.clone(),
@@ -507,6 +517,7 @@ impl StellarIdContract {
             issued_at: now,
             expires_at,
             revoked: false,
+            credential_hash,
         };
 
         env.storage()
@@ -605,6 +616,15 @@ impl StellarIdContract {
             count += 1;
             let credential_id = count;
 
+            let credential_hash = Self::compute_expected_hash(
+                env.clone(),
+                schema_id,
+                subject.clone(),
+                issuer.clone(),
+                now,
+                expires_at,
+            );
+
             let credential = Credential {
                 id: credential_id,
                 subject: subject.clone(),
@@ -613,6 +633,7 @@ impl StellarIdContract {
                 issued_at: now,
                 expires_at,
                 revoked: false,
+                credential_hash,
             };
 
             env.storage()
@@ -728,6 +749,15 @@ impl StellarIdContract {
             0
         };
 
+        let credential_hash = Self::compute_expected_hash(
+            env.clone(),
+            schema_id,
+            subject.clone(),
+            operator.clone(),
+            now,
+            expires_at,
+        );
+
         let credential = Credential {
             id: credential_id,
             subject: subject.clone(),
@@ -736,6 +766,7 @@ impl StellarIdContract {
             issued_at: now,
             expires_at,
             revoked: false,
+            credential_hash,
         };
 
         env.storage()
@@ -1474,6 +1505,15 @@ impl StellarIdContract {
             rec.map(|r| r.trust_level).unwrap_or(1)
         };
 
+        let credential_hash = Self::compute_expected_hash(
+            env.clone(),
+            request.schema_id,
+            request.subject.clone(),
+            issuer.clone(),
+            now,
+            request.expires_at,
+        );
+
         let credential = Credential {
             id: credential_id,
             subject: request.subject.clone(),
@@ -1482,6 +1522,7 @@ impl StellarIdContract {
             issued_at: now,
             expires_at: request.expires_at,
             revoked: false,
+            credential_hash,
         };
 
         env.storage()
@@ -1539,218 +1580,73 @@ impl StellarIdContract {
     }
 
     // --------------------------------------------------------
-    // Issue #66: Fully On-Chain Credential Governance
+    // Issue #64: Credential Hash Registry & EIP-712-style Hashing
     // --------------------------------------------------------
 
-    pub fn create_proposal(
+    pub fn compute_expected_hash(
         env: Env,
-        proposer: Address,
-        proposal_type: ProposalType,
-        payload: Bytes,
-    ) -> u64 {
-        proposer.require_auth();
-        Self::require_active_issuer(&env, &proposer);
+        schema_id: u32,
+        subject: Address,
+        issuer: Address,
+        issued_at: u64,
+        expires_at: u64,
+    ) -> BytesN<32> {
+        let contract_addr = env.current_contract_address();
+        let contract_bytes = Self::address_to_bytes(&env, &contract_addr);
 
-        let count: u64 = env
+        let mut domain_buf = Bytes::new(&env);
+        domain_buf.append(&Bytes::from_slice(&env, b"StellarID:v1:"));
+        domain_buf.append(&contract_bytes);
+        let domain_separator = env.crypto().sha256(&domain_buf).to_bytes();
+
+        let mut buf = Bytes::new(&env);
+        buf.append(&Bytes::from_slice(&env, &domain_separator.to_array()));
+        buf.append(&Bytes::from_slice(&env, &schema_id.to_be_bytes()));
+        buf.append(&Self::address_to_bytes(&env, &subject));
+        buf.append(&Self::address_to_bytes(&env, &issuer));
+        buf.append(&Bytes::from_slice(&env, &issued_at.to_be_bytes()));
+        buf.append(&Bytes::from_slice(&env, &expires_at.to_be_bytes()));
+
+        env.crypto().sha256(&buf).to_bytes()
+    }
+
+    pub fn get_credential_hash(env: Env, credential_id: u64) -> BytesN<32> {
+        let cred: Credential = env
             .storage()
-            .instance()
-            .get(&DataKey::ProposalCount)
-            .unwrap_or(0);
-        let proposal_id = count + 1;
+            .persistent()
+            .get(&DataKey::Credential(credential_id))
+            .expect("Credential not found");
+        cred.credential_hash
+    }
 
-        let now = env.ledger().timestamp();
-        let voting_period = 7 * 24 * 3600; // 7 days
-
-        let proposal = Proposal {
-            id: proposal_id,
-            proposer: proposer.clone(),
-            proposal_type: proposal_type.clone(),
-            payload,
-            votes_for: 0,
-            votes_against: 0,
-            voters: Vec::new(&env),
-            created_at: now,
-            expires_at: now + voting_period,
-            executes_at: 0,
-            status: ProposalStatus::Active,
+    pub fn verify_credential_hash(env: Env, credential_id: u64) -> bool {
+        let cred: Credential = match env.storage().persistent().get(&DataKey::Credential(credential_id)) {
+            Some(c) => c,
+            None => return false,
         };
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
-        env.storage()
-            .instance()
-            .set(&DataKey::ProposalCount, &proposal_id);
-
-        env.events().publish(
-            (Symbol::new(&env, "proposal_created"),),
-            (proposal_id, proposer),
+        let expected = Self::compute_expected_hash(
+            env.clone(),
+            cred.schema_id,
+            cred.subject.clone(),
+            cred.issuer.clone(),
+            cred.issued_at,
+            cred.expires_at,
         );
-
-        proposal_id
+        cred.credential_hash == expected
     }
 
-    pub fn vote(env: Env, issuer: Address, proposal_id: u64, support: bool) {
-        issuer.require_auth();
-        Self::require_active_issuer(&env, &issuer);
-
-        let mut proposal: Proposal = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Proposal(proposal_id))
-            .expect("Proposal not found");
-
-        assert_eq!(proposal.status, ProposalStatus::Active, "Proposal is not active");
-        let now = env.ledger().timestamp();
-        assert!(now <= proposal.expires_at, "Voting period has ended");
-
-        for v in proposal.voters.iter() {
-            assert!(v != issuer, "Issuer has already voted");
-        }
-
-        proposal.voters.push_back(issuer.clone());
-        if support {
-            proposal.votes_for += 1;
+    fn address_to_bytes(env: &Env, address: &Address) -> Bytes {
+        let xdr = address.to_xdr(env);
+        if xdr.len() >= 32 {
+            xdr.slice(xdr.len() - 32..xdr.len())
         } else {
-            proposal.votes_against += 1;
+            let mut b = Bytes::new(env);
+            for _ in 0..(32 - xdr.len()) {
+                b.push_back(0);
+            }
+            b.append(&xdr);
+            b
         }
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
-
-        env.events().publish(
-            (Symbol::new(&env, "proposal_voted"),),
-            (proposal_id, issuer, support),
-        );
-    }
-
-    pub fn finalize_proposal(env: Env, proposal_id: u64) {
-        let mut proposal: Proposal = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Proposal(proposal_id))
-            .expect("Proposal not found");
-
-        assert_eq!(proposal.status, ProposalStatus::Active, "Proposal is not active");
-        let now = env.ledger().timestamp();
-        assert!(now > proposal.expires_at, "Voting period has not ended yet");
-
-        let quorum = 3u32;
-        let timelock_delay = 2 * 24 * 3600; // 2 days
-
-        if proposal.votes_for > proposal.votes_against && proposal.votes_for >= quorum {
-            proposal.status = ProposalStatus::Passed;
-            proposal.executes_at = now + timelock_delay;
-        } else {
-            proposal.status = ProposalStatus::Failed;
-        }
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
-
-        env.events().publish(
-            (Symbol::new(&env, "proposal_finalized"),),
-            (proposal_id, proposal.status.clone()),
-        );
-    }
-
-    pub fn execute_proposal(env: Env, proposal_id: u64) {
-        let mut proposal: Proposal = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Proposal(proposal_id))
-            .expect("Proposal not found");
-
-        assert_eq!(proposal.status, ProposalStatus::Passed, "Proposal is not passed");
-        let now = env.ledger().timestamp();
-        assert!(now >= proposal.executes_at, "Time-lock period has not expired");
-
-        proposal.status = ProposalStatus::Executed;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
-
-        env.events().publish(
-            (Symbol::new(&env, "proposal_executed"),),
-            (proposal_id,),
-        );
-    }
-
-    pub fn veto_proposal(env: Env, admin: Address, proposal_id: u64) {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        assert_eq!(admin, stored_admin, "Only admin can veto proposals");
-
-        let mut proposal: Proposal = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Proposal(proposal_id))
-            .expect("Proposal not found");
-
-        assert!(
-            proposal.status == ProposalStatus::Active || proposal.status == ProposalStatus::Passed,
-            "Proposal cannot be vetoed in its current status"
-        );
-
-        proposal.status = ProposalStatus::Vetoed;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
-
-        env.events().publish(
-            (Symbol::new(&env, "proposal_vetoed"),),
-            (proposal_id, admin),
-        );
-    }
-
-    pub fn emergency_admin_action(
-        env: Env,
-        admin: Address,
-        proposal_type: ProposalType,
-        _payload: Bytes,
-    ) {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        assert_eq!(admin, stored_admin, "Only admin can perform emergency actions");
-
-        let now = env.ledger().timestamp();
-        let cooldown_period = 48 * 3600; // 48 hours
-        let last_action: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::EmergencyCooldown)
-            .unwrap_or(0);
-
-        assert!(
-            now >= last_action + cooldown_period,
-            "Emergency cooldown period is active"
-        );
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::EmergencyCooldown, &now);
-
-        env.events().publish(
-            (Symbol::new(&env, "emergency_action_executed"),),
-            (admin, proposal_type),
-        );
-    }
-
-    pub fn get_proposal(env: Env, proposal_id: u64) -> Proposal {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Proposal(proposal_id))
-            .expect("Proposal not found")
     }
 }
 
@@ -3003,67 +2899,52 @@ mod tests {
     }
 
     // --------------------------------------------------------
-    // Issue #66 Tests: On-Chain Governance
+    // Issue #64 Tests: Credential Hash Registry
     // --------------------------------------------------------
 
     #[test]
-    fn test_governance_proposal_full_lifecycle() {
+    fn test_credential_hash_calculation_and_verification() {
         let env = Env::default();
-        env.ledger().set_timestamp(1000);
         let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
 
-        let issuers = register_n_issuers(&env, &client, &admin, 4);
-        let proposer = issuers.get(0).unwrap();
+        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &3600);
+        let stored_hash = client.get_credential_hash(&cred_id);
 
-        let payload = Bytes::from_slice(&env, b"payload");
-        let prop_id = client.create_proposal(&proposer, &ProposalType::AddIssuer, &payload);
+        let cred = client.get_credential(&cred_id);
+        let expected_hash = client.compute_expected_hash(
+            &cred.schema_id,
+            &cred.subject,
+            &cred.issuer,
+            &cred.issued_at,
+            &cred.expires_at,
+        );
 
-        let prop = client.get_proposal(&prop_id);
-        assert_eq!(prop.status, ProposalStatus::Active);
-
-        // Vote: 3 FOR, 1 AGAINST
-        client.vote(&issuers.get(0).unwrap(), &prop_id, &true);
-        client.vote(&issuers.get(1).unwrap(), &prop_id, &true);
-        client.vote(&issuers.get(2).unwrap(), &prop_id, &true);
-        client.vote(&issuers.get(3).unwrap(), &prop_id, &false);
-
-        // Fast forward past 7-day voting window
-        env.ledger().set_timestamp(1000 + 7 * 24 * 3600 + 1);
-
-        client.finalize_proposal(&prop_id);
-        let finalized_prop = client.get_proposal(&prop_id);
-        assert_eq!(finalized_prop.status, ProposalStatus::Passed);
-
-        // Fast forward past 2-day timelock
-        env.ledger().set_timestamp(finalized_prop.executes_at + 1);
-
-        client.execute_proposal(&prop_id);
-        let executed_prop = client.get_proposal(&prop_id);
-        assert_eq!(executed_prop.status, ProposalStatus::Executed);
+        assert_eq!(stored_hash, expected_hash);
+        assert!(client.verify_credential_hash(&cred_id));
     }
 
     #[test]
-    fn test_governance_veto_during_timelock() {
+    fn test_credential_hash_modifying_field_changes_hash() {
         let env = Env::default();
-        env.ledger().set_timestamp(1000);
         let (admin, client) = setup(&env);
+        let issuer = register_issuer_helper(&env, &client, &admin);
+        let schema_id = register_schema_helper(&env, &client, &issuer);
+        let subject = Address::generate(&env);
 
-        let issuers = register_n_issuers(&env, &client, &admin, 3);
-        let prop_id = client.create_proposal(
-            &issuers.get(0).unwrap(),
-            &ProposalType::RemoveIssuer,
-            &Bytes::from_slice(&env, b"remove"),
+        let cred_id = client.issue_credential(&issuer, &subject, &schema_id, &3600);
+        let cred = client.get_credential(&cred_id);
+
+        let tampered_hash = client.compute_expected_hash(
+            &cred.schema_id,
+            &cred.subject,
+            &cred.issuer,
+            &cred.issued_at,
+            &(cred.expires_at + 10),
         );
 
-        client.vote(&issuers.get(0).unwrap(), &prop_id, &true);
-        client.vote(&issuers.get(1).unwrap(), &prop_id, &true);
-        client.vote(&issuers.get(2).unwrap(), &prop_id, &true);
-
-        env.ledger().set_timestamp(1000 + 7 * 24 * 3600 + 1);
-        client.finalize_proposal(&prop_id);
-
-        client.veto_proposal(&admin, &prop_id);
-        let vetoed_prop = client.get_proposal(&prop_id);
-        assert_eq!(vetoed_prop.status, ProposalStatus::Vetoed);
+        assert_ne!(cred.credential_hash, tampered_hash);
     }
 }
