@@ -59,8 +59,8 @@ SubIssuer (persistent storage, keyed by (parent, sub) tuple)
 
 ## Storage Strategy
 
-- `instance()` — used for global counters (CredentialCount, SchemaCount) and Admin
-- `persistent()` — used for all user data (Issuers, Schemas, Credentials, Identities, Accumulators)
+- `instance()` — used for global counters (CredentialCount, SchemaCount, ProposalCount) and Admin
+- `persistent()` — used for all user data (Issuers, Schemas, Credentials, Identities, Proposals)
 
 Persistent storage entries have their own TTL and survive contract upgrades. Instance storage is tied to the contract instance.
 
@@ -76,7 +76,13 @@ Persistent storage entries have their own TTL and survive contract upgrades. Ins
 | `register_schema` | Active issuer only |
 | `issue_credential` | Active registered issuer only |
 | `revoke_credential` | Original issuer only |
-| All `get_*` / `has_*` / `verify_*` | Anyone — no auth required |
+| `create_proposal` | Active registered issuer only |
+| `vote` | Active registered issuer only |
+| `finalize_proposal` | Anyone (after voting period) |
+| `execute_proposal` | Anyone (after time-lock) |
+| `veto_proposal` | Admin only |
+| `emergency_admin_action` | Admin only (48h cooldown) |
+| All `get_*` / `has_*` | Anyone — no auth required |
 
 ---
 
